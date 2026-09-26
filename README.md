@@ -32,9 +32,11 @@ This project wraps that engine in a native SAPI5 interface; the wrapper itself i
 
 **Download `PocketTTS_SAPI5_Setup.exe` from the [Releases](../../releases) page.**
 
-The installer bundles everything: both SAPI5 engine DLLs, the Voice Manager, the English Pocket TTS model, four default voices (Alba, Jane, George, Michael), and a self-contained Python runtime. During setup you can choose to put the Voice Manager on your desktop and to start the speech engine automatically at sign-in (recommended — speech then starts instantly).
+The installer bundles everything: both SAPI5 engine DLLs, the Voice Manager, Kyutai's September 2026 English Pocket TTS model (`english_2026-09`), four default voices (Alba, Jane, George, Michael), and a self-contained Python runtime. During setup you can choose to put the Voice Manager on your desktop and to start the speech engine automatically at sign-in (recommended — speech then starts instantly).
 
 After installation the Pocket TTS voices appear in every SAPI5 application. In NVDA: NVDA menu → Preferences → Settings → Speech → synthesizer **SAPI5**, then pick a Pocket TTS voice.
+
+Installing a new version over an old one keeps your cloned voices. When the engine starts with a different AI model than your voices were made with, it rebuilds every voice that has its audio sample for the new model, which takes a few seconds per voice.
 
 > **Why is the installer required?** GitHub does not allow files over 100 MB in a repository, and the AI model (~220 MB) and the bundled Python runtime (~600 MB) are far past that. Cloning this repository gives you all source code, the compiled wrapper binaries, and the default voice files — the model and runtime ship in the installer, or can be fetched with the scripts in `installer\` (see [Building from source](#building-from-source)).
 
@@ -65,7 +67,7 @@ The Voice Manager's **Update AI Models** button downloads the newest Pocket TTS 
 1. **Create a free Hugging Face account** at [huggingface.co/join](https://huggingface.co/join) (skip if you have one) and sign in.
 2. **Accept the model terms**: open the model page at [huggingface.co/kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts). Near the top there is a form titled "You need to agree to share your contact information to access this model". Fill in the two fields (your organization or just "Personal", and what you want to use it for) and press **Agree and access repository**. The page will then say "You have been granted access to this model".
 3. **Create a read token**: go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), choose **Create new token**, pick the **Read** token type, give it any name (for example "pocket-tts"), and press **Create token**. Copy the token — it starts with `hf_`.
-4. **Run the update**: in the Voice Manager, press **Update AI Models**, paste the token into the "Hugging Face access token" field, and press **Update Now**. Progress is announced in the dialog; when it finishes, all your voices — cloned and default — have been rebuilt for the new model.
+4. **Run the update**: in the Voice Manager, press **Update AI Models**, paste the token into the "Hugging Face access token" field, and press **Update Now**. Progress is announced in the dialog; when it finishes, all your voices — cloned and default — have been rebuilt for the new model. If the download is damaged or the new model will not load, the previous model is put back and the dialog says so.
 
 The token stays on Hugging Face's side of the connection; this software only uses it for the download and does not store it.
 
@@ -80,7 +82,7 @@ Kyutai has released the full training code, so you can train a brand-new Pocket 
    - `tokenizer.model` — the sentencepiece tokenizer used in training
    - `config.yaml` — your model config, with `weights_path` and `lookup_table.tokenizer_path` pointing at those two files (see the shipped `config.yaml` for the expected shape)
    
-   Then restart the engine (sign out and back in, or end `PocketTTSHost.exe` in Task Manager — it restarts on demand) and **re-clone your voices from their audio samples**: voice embeddings are tied to the model weights, so voices made with a different model will not work.
+   Then restart the engine (sign out and back in, or end `PocketTTSHost.exe` in Task Manager — it restarts on demand). Voice embeddings are tied to the model weights, so the engine notices the new weights and rebuilds every voice from its audio sample; a voice without one (imported without samples) keeps its old embedding and will not sound right until you clone it again.
 4. Community-trained models can also be published on Hugging Face and shared — see [Models trained by the community](https://github.com/kyutai-labs/pocket-tts#models-trained-by-the-community) for how Kyutai lists them.
 
 ## Building from source
@@ -89,7 +91,7 @@ Requirements: Windows 10+, Visual Studio 2022 (or Build Tools) with C++, CMake 3
 
 1. Clone [kyutai-labs/pocket-tts](https://github.com/kyutai-labs/pocket-tts) into `bin\pocket-tts`.
 2. Create a Python 3.10 venv at `%USERPROFILE%\.pockettts\venv` and run `pip install "bin\pocket-tts[audio]"`.
-3. Place the English model in `C:\ProgramData\PocketTTS\models\english\` (`config.yaml`, `model.safetensors`, `tokenizer.model`). The weights come from Hugging Face — accept the terms at [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) first (see the token guide above); the tokenizer is in [kyutai/pocket-tts-without-voice-cloning](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning).
+3. Put the English model's `model.safetensors` and `tokenizer.model` in `C:\ProgramData\PocketTTS\models\english\`, or in any folder you then pass to `installer\prepare_voices.py`. The weights are `languages/english/model.safetensors` in [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) — accept the terms there first (see the token guide above); the tokenizer is `languages/english/tokenizer.model` in [kyutai/pocket-tts-without-voice-cloning](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning). The model's `config.yaml` is kept in this repository, in `installer\staging\models\english\`.
 4. Build:
 
 ```batch
@@ -97,7 +99,7 @@ build_all.bat
 build_installer.bat
 ```
 
-`build_all.bat` produces the SAPI DLLs and the Voice Manager in `output\`. `build_installer.bat` assembles the embedded Python runtime (`installer\prepare_runtime.ps1`), stages the default voices (`installer\prepare_voices.py`), and compiles `output\PocketTTS_SAPI5_Setup.exe`.
+`build_all.bat` produces the SAPI DLLs and the Voice Manager in `output\`. `build_installer.bat` assembles the embedded Python runtime (`installer\prepare_runtime.ps1`), stages the model and embeds the default voices with it (`installer\prepare_voices.py`), and compiles `output\PocketTTS_SAPI5_Setup.exe`.
 
 ## Architecture
 

@@ -52,6 +52,8 @@ MODELS_DIR = DATA_DIR / "models"
 VOICES_DIR = DATA_DIR / "voices"
 VOICES_SRC_DIR = VOICES_DIR / "src"
 VOICES_INI = VOICES_DIR / "voices.ini"
+# SHA-256 of the model weights the voices were last built with.
+VOICES_MODEL_STAMP = VOICES_DIR / "model.sha256"
 CONFIG_YAML = MODELS_DIR / "english" / "config.yaml"
 
 PORTS = (17853, 17854, 17855, 17856, 17857)
@@ -59,7 +61,7 @@ PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 
 # Commands
 CMD_PING = 0
@@ -249,6 +251,30 @@ class VoiceStore:
 # Engine wrapper with cancellable streaming generation
 # ---------------------------------------------------------------------------
 
+# Before speech starts, the end-of-speech signal of some voices can already
+# cross its threshold, and a single word then ends before it is spoken. It is
+# ignored on the first 6 frames (0.48 s), as in pocket-tts 3.2.0
+# (kyutai-labs/pocket-tts#319); no word or sentence ends that soon.
+MIN_FRAMES_BEFORE_EOS = 6
+
+
+def _use_trained_gelu():
+    """Kyutai trained the released weights with the tanh approximation of
+    GELU, but pocket-tts 3.0.2 computes the exact GELU in the transformer
+    feed-forward block. pocket-tts 3.1.0 switched to the tanh form
+    (kyutai-labs/pocket-tts#278); the bundled 3.0.2 does the same here."""
+    import torch.nn.functional as F
+    from pocket_tts.modules.transformer import StreamingTransformerLayer
+
+    def _ff_block(self, x):
+        x_orig = x
+        x = self.norm2(x)
+        update = self.linear2(F.gelu(self.linear1(x), approximate="tanh"))
+        return x_orig.to(update) + self.layer_scale_2(update)
+
+    StreamingTransformerLayer._ff_block = _ff_block
+
+
 class Engine:
     def __init__(self):
         self.model = None
@@ -260,6 +286,7 @@ class Engine:
     def load(self):
         try:
             from pocket_tts import TTSModel
+            _use_trained_gelu()
             if not CONFIG_YAML.exists():
                 raise FileNotFoundError(
                     f"Model config not found: {CONFIG_YAML}. "
@@ -290,6 +317,69 @@ class Engine:
                 logger.info("rewrote model config paths to %s", actual)
         except OSError:
             logger.warning("could not rewrite config paths", exc_info=True)
+
+    def after_load(self):
+        """Background work once the model is loaded: bring the voices in
+        line with it, then warm up."""
+        try:
+            self.sync_voices_with_model()
+        except Exception:
+            logger.exception("voice rebuild failed (non-fatal)")
+        self.warm_up()
+
+    def sync_voices_with_model(self):
+        """A voice only sounds right on the weights that built it. When the
+        model differs from the one the voices were last built with (a new
+        version installed over an old one, or model files replaced by hand),
+        rebuild them from their audio samples."""
+        if self.model is None or not self.model.has_voice_cloning:
+            return
+        current = _model_fingerprint().get("sha256")
+        try:
+            recorded = VOICES_MODEL_STAMP.read_text(encoding="ascii").strip()
+        except OSError:
+            recorded = ""
+        if not current or recorded == current:
+            return
+        logger.info("voices were built with model %s, the model is now %s; "
+                    "rebuilding them", recorded[:12] or "(unrecorded)",
+                    current[:12])
+        self.rebuild_voices(lambda msg: logger.info("voices: %s", msg))
+
+    def rebuild_voices(self, progress):
+        """Re-embed every voice that still has its audio sample with the
+        loaded model, and record that model as the voices' model."""
+        from pocket_tts.models.model_state import export_model_state
+        for name, props in STORE.read().items():
+            source = props.get("source", "")
+            if not source:
+                progress(f'Voice "{name}" has no source audio; leaving as is.')
+                continue
+            src = VOICES_DIR / source
+            if not src.exists():
+                progress(f'Source audio for "{name}" is missing; leaving as is.')
+                continue
+            progress(f'Rebuilding voice "{name}" for the new model...')
+            dest = VOICES_DIR / props.get("file", name + ".safetensors")
+            tmp = dest.with_name(dest.name + ".new")
+            try:
+                with self.gen_lock:
+                    state = self.model.get_state_for_audio_prompt(
+                        src, truncate=True)
+                # Replaced in one step: a voice may be loaded to speak meanwhile.
+                export_model_state(state, tmp)
+                os.replace(tmp, dest)
+            except Exception:   # noqa: BLE001
+                logger.exception("could not rebuild voice %r", name)
+                progress(f'Could not rebuild voice "{name}"; leaving as is.')
+        self.clear_cache()
+        sha = _model_fingerprint().get("sha256")
+        if sha:
+            try:
+                VOICES_MODEL_STAMP.write_text(sha + "\n", encoding="ascii")
+            except OSError:
+                logger.warning("could not record the voices' model",
+                               exc_info=True)
 
     def warm_up(self):
         """First generation initialises lazy torch state; do it off the
@@ -367,9 +457,10 @@ class Engine:
 
     def _stream_one(self, model_state, text, frames_after_eos, cancel):
         """Cancellable re-implementation of pocket-tts
-        _generate_audio_stream_short_text (pinned to pocket-tts 3.0.2):
-        latents are produced on this thread and decoded by a worker so
-        throughput matches upstream, but both loops watch `cancel`."""
+        _generate_audio_stream_short_text (pinned to pocket-tts 3.0.2, plus
+        the MIN_FRAMES_BEFORE_EOS guard from 3.2.0): latents are produced on
+        this thread and decoded by a worker so throughput matches upstream,
+        but both loops watch `cancel`."""
         import copy as _copy
         import queue as _queue
 
@@ -434,7 +525,8 @@ class Engine:
                             model._run_flow_lm_and_increment_step(
                                 model_state=model_state,
                                 backbone_input_latents=backbone)
-                        if is_eos.item() and eos_step is None:
+                        if (is_eos.item() and eos_step is None
+                                and step >= MIN_FRAMES_BEFORE_EOS):
                             eos_step = step
                         if (eos_step is not None
                                 and step >= eos_step + frames_after_eos):
@@ -546,7 +638,11 @@ class Engine:
 
     def update_models(self, token, progress):
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import disable_progress_bars
 
+        # No one can see a progress bar in the host; the Voice Manager shows
+        # the progress messages instead.
+        disable_progress_bars()
         token = token or None
         english = MODELS_DIR / "english"
         english.mkdir(parents=True, exist_ok=True)
@@ -561,40 +657,37 @@ class Engine:
             filename="languages/english/tokenizer.model", token=token)
 
         progress("Installing the new model files...")
-        shutil.copy(model_file, english / "model.safetensors.new")
-        os.replace(english / "model.safetensors.new",
-                   english / "model.safetensors")
-        shutil.copy(tok_file, english / "tokenizer.model.new")
-        os.replace(english / "tokenizer.model.new",
-                   english / "tokenizer.model")
+        # The previous files are kept as *.old until the new model loads.
+        installed = []
+        for src, name in ((model_file, "model.safetensors"),
+                          (tok_file, "tokenizer.model")):
+            dest = english / name
+            shutil.copy(src, english / (name + ".new"))
+            if dest.exists():
+                os.replace(dest, english / (name + ".old"))
+            os.replace(english / (name + ".new"), dest)
+            installed.append(dest)
 
         progress("Loading the new model...")
         with self.gen_lock:
             self.clear_cache()
             self.load()
-        if self.model is None:
-            raise RuntimeError(f"new model failed to load: {self.load_error}")
-
-        # Voice states are tied to the model weights, so re-embed every
-        # voice that still has its source audio.
-        voices = STORE.read()
-        from pocket_tts.models.model_state import export_model_state
-        for name, props in voices.items():
-            source = props.get("source", "")
-            if not source:
-                progress(f'Voice "{name}" has no source audio; leaving as is.')
-                continue
-            src = VOICES_DIR / source
-            if not src.exists():
-                progress(f'Source audio for "{name}" is missing; leaving as is.')
-                continue
-            progress(f'Rebuilding voice "{name}" for the new model...')
+        # A failed load keeps the previous model in memory and sets load_error.
+        if self.model is None or self.load_error:
+            error = self.load_error
+            for dest in installed:
+                old = dest.with_name(dest.name + ".old")
+                if old.exists():
+                    os.replace(old, dest)
             with self.gen_lock:
-                state = self.model.get_state_for_audio_prompt(
-                    src, truncate=True)
-            export_model_state(
-                state, VOICES_DIR / props.get("file", name + ".safetensors"))
-        self.clear_cache()
+                self.load()
+            raise RuntimeError("the new model failed to load, so the previous "
+                               f"one was kept: {error}")
+        for dest in installed:
+            dest.with_name(dest.name + ".old").unlink(missing_ok=True)
+
+        # Voice states are tied to the model weights.
+        self.rebuild_voices(progress)
         progress("Model update complete.")
 
     # -- voice packages -----------------------------------------------------
@@ -1701,7 +1794,24 @@ def _opt_out_of_background_throttling():
                        "(error %d)", ctypes.get_last_error())
 
 
+# ---------------------------------------------------------------------------
+# Standard streams
+# ---------------------------------------------------------------------------
+#
+# PocketTTSHost.exe is a renamed pythonw.exe, so the host has no console and
+# sys.stdout and sys.stderr are None. Libraries that write to them without
+# checking then fail: huggingface_hub's download progress bar raised
+# "'NoneType' object has no attribute 'write'" and aborted every model update.
+# The output has nowhere to go, so it is discarded.
+
+def _ensure_std_streams():
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def main():
+    _ensure_std_streams()
     handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2,
                                   encoding="utf-8")
     level = getattr(logging,
@@ -1729,7 +1839,7 @@ def main():
     _opt_out_of_background_throttling()
 
     ENGINE.load()
-    threading.Thread(target=ENGINE.warm_up, daemon=True).start()
+    threading.Thread(target=ENGINE.after_load, daemon=True).start()
     server.serve()
     return 0
 

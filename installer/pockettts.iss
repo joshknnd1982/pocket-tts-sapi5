@@ -8,7 +8,7 @@
 ;                                           (installer\prepare_voices.py)
 
 #define MyAppName "Pocket TTS SAPI5"
-#define MyAppVersion "1.1.2"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Josh Kennedy"
 
 [Setup]
