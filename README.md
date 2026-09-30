@@ -127,7 +127,7 @@ A machine slower than about 0.5x realtime cannot read long passages without gaps
 
 ### How numbers are spoken
 
-The Pocket TTS model has no vocabulary entry for a number: it receives "224" as three unrelated tokens, "2", "2" and "4", and has to guess what to say. It guesses badly. Digits come out one at a time, and a repeated digit is merged or dropped, so "224" was heard as "24" and "999" as "ninety-nine". Words are something the model knows well, so the engine host writes every number out in words before the text reaches the model (`host\pockettts_text.py`):
+The Pocket TTS model has no vocabulary entry for a number: it receives "224" as three unrelated tokens, "2", "2" and "4", and has to guess what to say. It guesses badly. It reads the digits one at a time ("224" comes out as a quick "two two four"), and a repeated or neighbouring digit is sometimes merged or dropped: "224" was heard as "24" (issue #2), and in testing "707" as "seventy seven" and "999" as "ninety nine". Words are something the model knows well, so the engine host writes every number out in words before the text reaches the model (`host\pockettts_text.py`):
 
 | Text | Spoken |
 |---|---|
