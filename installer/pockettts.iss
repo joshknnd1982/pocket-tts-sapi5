@@ -8,7 +8,7 @@
 ;                                           (installer\prepare_voices.py)
 
 #define MyAppName "Pocket TTS SAPI5"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "Josh Kennedy"
 
 [Setup]
@@ -41,6 +41,7 @@ Source: "..\output\PocketTTSSAPI.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\output\x64\PocketTTSSAPI.dll"; DestDir: "{app}\x64"; Flags: ignoreversion
 Source: "..\output\PocketTTSVoiceManager.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\host\pockettts_host.py"; DestDir: "{app}\host"; Flags: ignoreversion
+Source: "..\host\pockettts_text.py"; DestDir: "{app}\host"; Flags: ignoreversion
 Source: "..\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs
 ; AI model (large). Overwritten on upgrade; the Voice Manager can update it later.
 Source: "staging\models\*"; DestDir: "{commonappdata}\PocketTTS\models"; Flags: ignoreversion recursesubdirs

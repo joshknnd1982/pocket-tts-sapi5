@@ -21,6 +21,7 @@ This project wraps that engine in a native SAPI5 interface; the wrapper itself i
 - **Fast**: ~100 ms to first audio once warm; speech cancellation in ~20 ms (screen-reader friendly)
 - **Voice cloning**: clone any voice from 10+ seconds of clean audio using the accessible Voice Manager
 - **Share voices**: export any or all of your voices — the built-in ones and the ones you cloned — to a single `.pttsvoices` file, and import voices other people send you; voices made with a different AI model are rebuilt automatically
+- **Numbers are spoken as numbers**: "224" is "two hundred twenty-four", not "24" — page numbers, times, prices, dates, phone numbers and the like are all written out in words before the AI model sees them (see [How numbers are spoken](#how-numbers-are-spoken))
 - **Instant publish / unpublish / delete** of voices in the SAPI voice list — no reboots, no registry hacking
 - **AI model updates** from Hugging Face inside the Voice Manager, with all cloned voices rebuilt automatically
 - **Rate (0.33x–3x), pitch, and volume** control via [sonic](https://github.com/waywardgeek/sonic) time-stretching, applied instantly even mid-utterance
@@ -123,6 +124,25 @@ Windows plays each piece of audio the moment the engine hands it over, so a PC t
 - **Full speed, whichever program started the engine.** Windows ranks a process that has no window of its own by the program that started it, and once that program closes it treats the process as background work, which it may run at a lower CPU speed or on the power-saving cores. The engine host tells Windows it is foreground work, so it keeps full speed after the program that started it has closed, and for every program that speaks through it afterwards.
 
 A machine slower than about 0.5x realtime cannot read long passages without gaps whatever the engine does; `host.log` records the measured figure on every utterance.
+
+### How numbers are spoken
+
+The Pocket TTS model has no vocabulary entry for a number: it receives "224" as three unrelated tokens, "2", "2" and "4", and has to guess what to say. It guesses badly. Digits come out one at a time, and a repeated digit is merged or dropped, so "224" was heard as "24" and "999" as "ninety-nine". Words are something the model knows well, so the engine host writes every number out in words before the text reaches the model (`host\pockettts_text.py`):
+
+| Text | Spoken |
+|---|---|
+| `224` | two hundred twenty-four |
+| `1,250` · `3.14` · `-5` | one thousand two hundred fifty · three point one four · minus five |
+| `21st` · `50%` | twenty-first · fifty percent |
+| `$5.50` · `£1` | five dollars and fifty cents · one pound |
+| `3:45 PM` · `10:00` · `1:23:45` | three forty-five P M · ten o'clock · one hour twenty-three minutes forty-five seconds |
+| `1999` · `2024` · `the 1990s` | nineteen ninety-nine · twenty twenty-four · the nineteen nineties |
+| `2026-09-30` | September thirtieth, twenty twenty-six |
+| `10-20` | ten to twenty |
+| `007` · `555-123-4567` · `1234567` | zero zero seven · five five five, one two three, four five six seven · one two three, four five six seven |
+| `v2.0.1` · `B52` · `5kg` | v two point zero point one · B fifty-two · five kg |
+
+A digit run with a leading zero, or seven or more digits with no separators, is treated as an identifier (a code, a phone or account number) and read digit by digit in groups; a four-digit number from 1100 to 2099 is read as a year. Everything that is not a number is passed to the model untouched. The rules have a test suite that needs nothing but Python: `python host\test_pockettts_text.py`.
 
 ## Logs and troubleshooting
 

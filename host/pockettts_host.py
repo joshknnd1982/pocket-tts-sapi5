@@ -26,6 +26,12 @@ import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# The bundled Python runtime has a python310._pth file, and with one Python
+# leaves the folder of the script off sys.path, so the module that sits next
+# to this file would not be found without this.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pockettts_text import expand_numbers  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Locations
 # ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # Commands
 CMD_PING = 0
@@ -437,6 +443,13 @@ class Engine:
         from pocket_tts.default_parameters import MAX_TOKEN_PER_CHUNK
         from pocket_tts.models.text_chunking import (
             prepare_text_prompt, split_into_best_sentences)
+
+        # The model has no tokens for numbers and mangles digit strings ("224"
+        # was heard as "24"), so numbers are written out in words first.
+        spoken = expand_numbers(text)
+        if spoken != text:
+            logger.debug("numbers written out: %r -> %r", text, spoken)
+            text = spoken
 
         model = self.model
         chunks = split_into_best_sentences(
