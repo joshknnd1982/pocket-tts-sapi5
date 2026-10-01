@@ -162,3 +162,5 @@ When reporting an issue, please include your Windows version, whether the applic
 - **Default voice samples**: from [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices); see that repository for per-voice licenses.
 - **Time-stretching**: [sonic](https://github.com/waywardgeek/sonic) by Bill Cox (Apache-2.0).
 - **SAPI5 wrapper, engine host, and Voice Manager**: this repository.
+
+The SAPI5 wrapper, engine host, and Voice Manager written for this project are licensed under the MIT License (see [LICENSE](LICENSE)); the third-party material credited above is not covered by that licence and stays under its owners' terms (see [NOTICE.md](NOTICE.md)).
