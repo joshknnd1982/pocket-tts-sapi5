@@ -161,6 +161,7 @@ When reporting an issue, please include your Windows version, whether the applic
 - **Pocket TTS engine and models**: [Kyutai](https://kyutai.org) — Manu Orsini, Simon Rouard, Gabriel De Marmiesse, Václav Volhejn, Neil Zeghidour, Alexandre Défossez. Code MIT, model weights CC-BY-4.0.
 - **Default voice samples**: from [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices); see that repository for per-voice licenses.
 - **Time-stretching**: [sonic](https://github.com/waywardgeek/sonic) by Bill Cox (Apache-2.0).
+- **SAPI5 plumbing** (the COM class factory, registry helpers, voice tokens and token enumerator): adapted from [gozaltech/BstSpeech-sapi](https://github.com/gozaltech/BstSpeech-sapi); the files are listed in [NOTICE.md](NOTICE.md).
 - **SAPI5 wrapper, engine host, and Voice Manager**: this repository.
 
-The SAPI5 wrapper, engine host, and Voice Manager written for this project are licensed under the MIT License (see [LICENSE](LICENSE)); the third-party material credited above is not covered by that licence and stays under its owners' terms (see [NOTICE.md](NOTICE.md)).
+The SAPI5 wrapper, engine host, and Voice Manager written for this project are licensed under the MIT License (see [LICENSE](LICENSE)); the third-party material credited above, including the SAPI5 plumbing files listed in [NOTICE.md](NOTICE.md), is not covered by that licence and stays under its owners' terms.

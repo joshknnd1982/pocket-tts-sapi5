@@ -3,6 +3,21 @@
 The code written for this project is licensed under the MIT License (see [LICENSE](LICENSE)). The material
 below is not covered by that licence and stays under its own terms.
 
+## SAPI5 plumbing adapted from gozaltech/BstSpeech-sapi
+
+These files were copied or adapted from the SAPI5 wrapper [gozaltech/BstSpeech-sapi](https://github.com/gozaltech/BstSpeech-sapi),
+which had no licence file in October 2026. They are not covered by this project's MIT License, and no licence is
+claimed for them here. The prebuilt `output/PocketTTSSAPI.dll` files are built from these sources and carry the
+same limit.
+
+- Identical to gozaltech's file of the same name, apart from the namespace name (and, in `voice_token.cpp`, the
+  vendor name): `src/com.hpp`, `src/com.cpp`, `src/registry.hpp`, `src/registry.cpp`, `src/utils.hpp`,
+  `src/ISpDataKeyImpl.hpp`, `src/ISpDataKeyImpl.cpp`, `src/voice_token.hpp`, `src/voice_token.cpp`.
+- Adapted from gozaltech's file of the same name, with small changes: `src/IEnumSpObjectTokensImpl.hpp`,
+  `src/IEnumSpObjectTokensImpl.cpp`, `src/sapi_main.cpp`, `src/ISpTTSEngineImpl.hpp`.
+- Reworked, but still sharing much of the text of gozaltech's file of the same name: `src/ISpTTSEngineImpl.cpp`,
+  `src/voice_attributes.hpp`, `CMakeLists.txt`, `build_all.bat`.
+
 ## Pocket TTS engine and models (Kyutai)
 
 The speech engine and the AI models this project wraps are by [Kyutai](https://kyutai.org): Manu Orsini, Simon
