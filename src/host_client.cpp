@@ -376,7 +376,7 @@ void append_u32_string(std::vector<char>& out, const std::string& s)
 }  // namespace
 
 bool HostClient::speak(const std::string& voiceUtf8, const std::string& textUtf8,
-                       AudioCallback callback, void* user)
+                       AudioCallback callback, void* user, bool spell)
 {
     CsLock lock(&cs_);
 
@@ -385,12 +385,13 @@ bool HostClient::speak(const std::string& voiceUtf8, const std::string& textUtf8
     }
 
     std::vector<char> payload;
-    payload.reserve(voiceUtf8.size() + textUtf8.size() + 8);
+    payload.reserve(voiceUtf8.size() + textUtf8.size() + 9);
     append_u16_string(payload, voiceUtf8);
     append_u32_string(payload, textUtf8);
+    payload.push_back(static_cast<char>(spell ? SPEAK_SPELL : 0));
 
-    DEBUG_LOG("speak: voice \"%s\", %u chars", voiceUtf8.c_str(),
-              (unsigned)textUtf8.size());
+    DEBUG_LOG("speak: voice \"%s\", %u chars%s", voiceUtf8.c_str(),
+              (unsigned)textUtf8.size(), spell ? ", spelled" : "");
     setRecvTimeout(120000);
     if (!sendFrame(CMD_SPEAK, payload.data(), static_cast<uint32_t>(payload.size()))) {
         DEBUG_LOG("speak: send failed; dropping connection");

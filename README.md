@@ -22,6 +22,7 @@ This project wraps that engine in a native SAPI5 interface; the wrapper itself i
 - **Voice cloning**: clone any voice from 10+ seconds of clean audio using the accessible Voice Manager
 - **Share voices**: export any or all of your voices — the built-in ones and the ones you cloned — to a single `.pttsvoices` file, and import voices other people send you; voices made with a different AI model are rebuilt automatically
 - **Numbers are spoken as numbers**: "224" is "two hundred twenty-four", not "24" — page numbers, times, prices, dates, phone numbers and the like are all written out in words before the AI model sees them (see [How numbers are spoken](#how-numbers-are-spoken))
+- **Arrow through text letter by letter**: a single letter, digit or punctuation mark — what a screen reader sends as you arrow left and right — is spoken by its name, clearly and promptly, in upper or lower case (see [How letters and symbols are spoken](#how-letters-and-symbols-are-spoken))
 - **Instant publish / unpublish / delete** of voices in the SAPI voice list — no reboots, no registry hacking
 - **AI model updates** from Hugging Face inside the Voice Manager, with all cloned voices rebuilt automatically
 - **Rate (0.33x–3x), pitch, and volume** control via [sonic](https://github.com/waywardgeek/sonic) time-stretching, applied instantly even mid-utterance
@@ -142,7 +143,26 @@ The Pocket TTS model has no vocabulary entry for a number: it receives "224" as 
 | `007` · `555-123-4567` · `1234567` | zero zero seven · five five five, one two three, four five six seven · one two three, four five six seven |
 | `v2.0.1` · `B52` · `5kg` | v two point zero point one · B fifty-two · five kg |
 
-A digit run with a leading zero, or seven or more digits with no separators, is treated as an identifier (a code, a phone or account number) and read digit by digit in groups; a four-digit number from 1100 to 2099 is read as a year. Everything that is not a number is passed to the model untouched. The rules have a test suite that needs nothing but Python: `python host\test_pockettts_text.py`.
+A digit run with a leading zero, or seven or more digits with no separators, is treated as an identifier (a code, a phone or account number) and read digit by digit in groups; a four-digit number from 1100 to 2099 is read as a year. The rules have a test suite that needs nothing but Python: `python host\test_pockettts_text.py`.
+
+### How letters and symbols are spoken
+
+A screen reader moving through text with the arrow keys sends one character at a time: "s", "S", "7", ",". The model was never taught to say a letter on its own, and it guessed: "s" came out garbled or with extra sounds, "Sess" (issue #3), and a punctuation mark on its own came out as nothing. So when a request is a single character, the engine host gives the model that character's name instead, spelled the way the model says it clearly:
+
+| Sent | Spoken |
+|---|---|
+| `s` · `S` | ess |
+| `a` · `h` · `j` · `w` · `z` | eh · aitch · jay · double you · zee |
+| `7` | seven |
+| `,` · `?` · `(` · `~` | comma · question mark · left parenthesis · tilde |
+| `é` · `ñ` · `α` | E acute · enn tilde · alpha |
+| `cap S` | cap, ess |
+
+The spellings were chosen by listening to the model, with a speech recognizer transcribing 24 takes of each candidate across the four default voices: "s" on its own was heard correctly 14 times out of 24 and "ess" 22, "j" 12 and "jay" 24, "i" 9 and "aye" 18. E and X are the two letters the model says best as they are.
+
+Upper- and lower-case letters have the same name; the screen reader already marks a capital its own way, with a higher pitch, a beep, or the word "cap", and all three come through. When an application asks for text to be spelled out (SAPI's `<spell>` tag, which NVDA uses for single characters), every character is named the same way. A letter inside a word or a sentence is left alone, and so is any longer text, except for three names screen readers give punctuation that the model said as other words: "paren" (heard as "Perron"), "colon" ("Colin") and "caret" ("correct") are respelled so that they come out right wherever they appear.
+
+The other half of the problem was where speech stopped. The model signals the end of speech, and the engine stops shortly after it. On a one-letter prompt that signal was often already on during the silence some voices open with — up to a second and a half for Jane and Michael — and the engine stopped part-way into the letter, or before it. The signal is now believed only once the audio has actually held speech, and the silence before the first word of a request is trimmed to 160 ms, so the letter is heard as soon as the model says it.
 
 ## Logs and troubleshooting
 

@@ -56,8 +56,10 @@ public:
     // POCKETTTS_SPEED_UNKNOWN while the host has not measured anything.
     float speedFactor() const { return speedFactor_; }
 
+    // `spell` asks the host to name each character instead of reading the
+    // text as words.
     bool speak(const std::string& voiceUtf8, const std::string& textUtf8,
-               AudioCallback callback, void* user);
+               AudioCallback callback, void* user, bool spell = false);
 
     bool listVoices(std::vector<HostVoice>& out, std::wstring& error);
     bool cloneVoice(const std::wstring& name, const std::wstring& audioPath,

@@ -401,3 +401,123 @@ def expand_numbers(text: str) -> str:
     if not _ANY_DIGIT.search(text):
         return text
     return _EVERYTHING.sub(_speak, text)
+
+
+# ---------------------------------------------------------------------------
+# Characters
+# ---------------------------------------------------------------------------
+#
+# A screen reader moving through text a character at a time sends one
+# character per request: "s", "S", "7", "," -- or, with SAPI's SpellOut
+# action, a run to be spelled. A letter on its own is not a word the model
+# has learned to say: "s" reached it as "S." and came out garbled or with
+# extra sounds, "Sess" (issue #3), and a punctuation mark on its own says
+# nothing at all. Each character is therefore given its name, spelled so
+# that the model says it clearly.
+
+# Chosen by listening tests, the model's speech transcribed by a speech
+# recognizer, 24 takes across the four default voices: "s" was heard right
+# 14 times, "ess" 22; "j" 12 times, "jay" 24; "i" 9 times, "aye" 18. "ay" is
+# said "eye", and "ee" "three". E and X are clearest as the capital letter.
+_LETTER_NAMES = {
+    "a": "eh", "b": "bee", "c": "see", "d": "dee", "e": "E", "f": "eff",
+    "g": "jee", "h": "aitch", "i": "aye", "j": "jay", "k": "kay",
+    "l": "ell", "m": "em", "n": "enn", "o": "oh", "p": "pee", "q": "cue",
+    "r": "are", "s": "ess", "t": "tee", "u": "you", "v": "vee",
+    "w": "double you", "x": "X", "y": "why", "z": "zee",
+}
+
+# The names of the marks a screen reader may pass on as they are, when it
+# has no name of its own for them. "tilda" is said as tilde is; "tilde" was
+# heard as "till day".
+_SYMBOL_NAMES = {
+    "!": "exclamation mark", '"': "quotation mark", "#": "number sign",
+    "$": "dollar sign", "%": "percent sign", "&": "ampersand",
+    "'": "apostrophe", "(": "left parenthesis", ")": "right parenthesis",
+    "*": "asterisk", "+": "plus sign", ",": "comma", "-": "dash",
+    ".": "period", "/": "slash", ":": "colon", ";": "semicolon",
+    "<": "less than", "=": "equals", ">": "greater than",
+    "?": "question mark", "@": "at sign", "[": "left bracket",
+    "\\": "backslash", "]": "right bracket", "^": "caret",
+    "_": "underscore", "`": "grave accent", "{": "left brace",
+    "|": "vertical bar", "}": "right brace", "~": "tilda",
+    "¡": "inverted exclamation mark", "¢": "cent sign", "£": "pound sign",
+    "¥": "yen sign", "€": "euro sign", "§": "section sign",
+    "©": "copyright sign", "®": "registered sign", "™": "trademark sign",
+    "°": "degree sign", "±": "plus or minus", "×": "times",
+    "÷": "divided by", "¶": "paragraph sign", "·": "middle dot",
+    "¿": "inverted question mark", "«": "left angle quote",
+    "»": "right angle quote", "‘": "left single quote",
+    "’": "right single quote", "“": "left quote", "”": "right quote",
+    "–": "en dash", "—": "em dash", "…": "ellipsis", "•": "bullet",
+}
+
+# Names of marks that the model says as another word, respelled so that it
+# says them as they sound: "left paren" was heard as "left Perron", "colon"
+# as "Colin" and "caret" as "correct". Screen readers send these names in
+# running text as well, so they are respelled wherever they appear.
+_RESPELLINGS = {"paren": "puh-ren", "colon": "co-lon", "caret": "carrot"}
+_RESPELL = re.compile(r"\b(?:" + "|".join(_RESPELLINGS) + r")\b", re.IGNORECASE)
+
+# "LATIN SMALL LETTER E WITH ACUTE" and the like.
+_ACCENTED = re.compile(r"LATIN (?:SMALL|CAPITAL) LETTER ([A-Z]) WITH (.+)")
+_GREEK = re.compile(r"GREEK (?:SMALL|CAPITAL) LETTER ([A-Z]+)")
+# A lone character, or "cap" and a lone letter, as NVDA says a capital when
+# it is set to. A letter may end a sentence: "s." is still the letter.
+_LONE = re.compile(r"\s*(?:(cap|capital)\s+)?(\S)\s*", re.IGNORECASE)
+_LONE_LETTER = re.compile(r"\s*(?:(cap|capital)\s+)?([^\W\d_])([.,;:!?])\s*",
+                          re.IGNORECASE)
+
+
+def character_name(char: str) -> str:
+    """What to call one character: "s" -> "ess", "7" -> "seven", "," ->
+    "comma". A character with no name is returned as it is."""
+    import unicodedata
+
+    lower = char.lower()
+    if lower in _LETTER_NAMES:
+        return _LETTER_NAMES[lower]
+    if char.isdecimal():
+        return _ONES[int(char)]
+    if char in _SYMBOL_NAMES:
+        return _SYMBOL_NAMES[char]
+    name = unicodedata.name(char, "")
+    accented = _ACCENTED.fullmatch(name)
+    if accented:
+        letter, marks = accented.groups()
+        return _LETTER_NAMES[letter.lower()] + " " + marks.lower()
+    greek = _GREEK.fullmatch(name)
+    if greek:
+        return greek.group(1).lower()
+    if name and unicodedata.category(char)[0] in "PS":
+        return name.lower()
+    return char
+
+
+def spell(text: str) -> str:
+    """Every character of `text` by name, for SAPI's SpellOut action."""
+    return ", ".join(character_name(c) for c in text if not c.isspace())
+
+
+def _respell(text: str) -> str:
+    def respelled(m):
+        word = m.group()
+        new = _RESPELLINGS[word.lower()]
+        return new[0].upper() + new[1:] if word[0].isupper() else new
+    return _RESPELL.sub(respelled, text)
+
+
+def speakable(text: str, spell_out: bool = False) -> str:
+    """`text` as the model should be given it: a character on its own, or
+    every character when `spell_out` is set, by name, and every number in
+    words."""
+    if spell_out:
+        return _respell(spell(text))
+    lone = _LONE.fullmatch(text)
+    lone_letter = _LONE_LETTER.fullmatch(text)
+    if lone or lone_letter:
+        cap, char, *mark = (lone or lone_letter).groups()
+        name = character_name(char) + "".join(mark)
+        # "cap ess" ran together into "Cappas"; a pause keeps them apart.
+        return _respell(f"{cap}, {name}" if cap else name)
+    return _respell(expand_numbers(text))

@@ -448,8 +448,10 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
                 }
             }
 
-            if (frag->State.eAction == SPVA_SpellOut) {
-                // Space the characters out so the model spells them.
+            const bool spell = frag->State.eAction == SPVA_SpellOut;
+            if (spell) {
+                // The host names each character. The spacing is for hosts
+                // before 1.2.2, which do not know the spell flag.
                 std::wstring spelled;
                 spelled.reserve(wide_text.size() * 2);
                 for (wchar_t c : wide_text) {
@@ -518,7 +520,8 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
                       "text \"%s\"", static_cast<unsigned>(run.size()),
                       ctx.speed, ctx.pitch, volume, text.c_str());
 
-            g_hostClient->speak(voice_name_utf8_, text, speak_callback, &ctx);
+            g_hostClient->speak(voice_name_utf8_, text, speak_callback, &ctx,
+                                spell);
 
             if (ctx.aborted) {
                 break;

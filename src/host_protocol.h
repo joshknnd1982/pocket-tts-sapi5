@@ -10,7 +10,7 @@
 enum HostCommand : uint32_t {
     CMD_PING = 0,
     CMD_LIST_VOICES = 1,
-    CMD_SPEAK = 2,          // <u16 voice_len><voice utf8><u32 text_len><text utf8>
+    CMD_SPEAK = 2,          // <u16 voice_len><voice utf8><u32 text_len><text utf8>[<u8 flags>]
     CMD_STOP = 3,
     CMD_CLONE = 4,          // <u16+name><u16+audio_path><u16+language_hex><u8 gender>
     CMD_SET_PUBLISHED = 5,  // <u16+name><u8 published>
@@ -23,6 +23,12 @@ enum HostCommand : uint32_t {
     CMD_EXPORT_VOICES = 10,   // <u16+dest_path><u8 include_sources><u32 count>{<u16+name>}
     CMD_IMPORT_VOICES = 11,   // <u16+package_path><u8 publish><u8 collision><u32 count>{<u16+name>}
     CMD_INSPECT_PACKAGE = 12, // <u16+package_path>
+};
+
+// CMD_SPEAK flags. The byte is optional: hosts before 1.2.2 ignore it, and
+// a request without it has no flags set.
+enum HostSpeakFlags : uint8_t {
+    SPEAK_SPELL = 1,        // name each character (SAPI's SpellOut action)
 };
 
 // What an import does with a voice whose name is already in use.

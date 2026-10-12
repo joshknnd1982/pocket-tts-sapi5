@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -30,7 +31,7 @@ from pathlib import Path
 # leaves the folder of the script off sys.path, so the module that sits next
 # to this file would not be found without this.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pockettts_text import expand_numbers  # noqa: E402
+from pockettts_text import speakable  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Locations
@@ -67,7 +68,7 @@ PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 # Commands
 CMD_PING = 0
@@ -83,6 +84,9 @@ CMD_INFO = 9
 CMD_EXPORT_VOICES = 10
 CMD_IMPORT_VOICES = 11
 CMD_INSPECT_PACKAGE = 12
+
+# CMD_SPEAK flags
+SPEAK_SPELL = 1   # name each character (SAPI's SpellOut action)
 
 # Responses
 RESP_OK = 0
@@ -263,6 +267,62 @@ class VoiceStore:
 # (kyutai-labs/pocket-tts#319); no word or sentence ends that soon.
 MIN_FRAMES_BEFORE_EOS = 6
 
+# Six frames are not enough for a prompt of a single word or letter, which
+# is what a screen reader sends while the user arrows through text. Some
+# voices then open with up to a second and a half of silence, the
+# end-of-speech signal is on from the second frame, and generation stopped
+# five frames after the guard, part-way into the letter or before it was
+# said at all (issue #3). The signal is therefore believed only once the
+# decoded audio has held speech for SPEECH_FRAMES_BEFORE_EOS frames. A frame
+# is speech at SPEECH_DBFS or louder; the model's silence measures about
+# -70 dBFS and its speech -35 to -15.
+SPEECH_DBFS = -40.0
+SPEECH_FRAMES_BEFORE_EOS = 2
+# A voice too quiet ever to reach SPEECH_DBFS must still end: past this many
+# frames (3.2 s) without speech the signal is believed anyway.
+FRAMES_BEFORE_EOS_WITHOUT_SPEECH = 40
+# The silence before the first word of a request only delays it, by up to a
+# second and a half on some voices: the words are on their way as soon as
+# the model starts saying them. This many frames of it are kept, so that a
+# soft first sound is not lost.
+FRAMES_BEFORE_SPEECH_KEPT = 2
+
+
+class _SpeechOnset:
+    """Where the decoded audio of one prompt turns into speech. The decoder
+    measures it frame by frame; the generating thread asks about it before it
+    believes the end-of-speech signal, and waits while the decoder catches
+    up."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self.decoded = 0     # frames decoded so far
+        self.frame = None    # the first frame that is speech
+        self.closed = False  # the decoder has stopped
+
+    def add(self, pcm):
+        """Record the next decoded frame, a float tensor in -1..1."""
+        rms = float(pcm.pow(2).mean().sqrt())
+        loud = rms > 0 and 20 * math.log10(rms) >= SPEECH_DBFS
+        with self._cond:
+            if loud and self.frame is None:
+                self.frame = self.decoded
+            self.decoded += 1
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+    def heard_by(self, frame, cancel):
+        """Whether speech had begun by `frame`."""
+        with self._cond:
+            while (self.frame is None and self.decoded <= frame
+                   and not self.closed and not cancel.is_set()):
+                self._cond.wait(0.05)
+            return self.frame is not None and self.frame <= frame
+
 
 def _use_trained_gelu():
     """Kyutai trained the released weights with the tanh approximation of
@@ -437,7 +497,7 @@ class Engine:
 
     # -- generation ---------------------------------------------------------
 
-    def _stream_chunks(self, model_state, text, cancel):
+    def _stream_chunks(self, model_state, text, cancel, spell=False):
         """Yield int16 PCM byte chunks; honours `cancel` between model steps
         so screen-reader interruptions take effect within ~one frame."""
         from pocket_tts.default_parameters import MAX_TOKEN_PER_CHUNK
@@ -445,10 +505,11 @@ class Engine:
             prepare_text_prompt, split_into_best_sentences)
 
         # The model has no tokens for numbers and mangles digit strings ("224"
-        # was heard as "24"), so numbers are written out in words first.
-        spoken = expand_numbers(text)
+        # was heard as "24"), and it garbles a letter or a symbol said on its
+        # own, so those are written out in words first.
+        spoken = speakable(text, spell)
         if spoken != text:
-            logger.debug("numbers written out: %r -> %r", text, spoken)
+            logger.debug("written out: %r -> %r", text, spoken)
             text = spoken
 
         model = self.model
@@ -456,7 +517,7 @@ class Engine:
             model.flow_lm.conditioner.tokenizer, text, MAX_TOKEN_PER_CHUNK,
             model.pad_with_spaces_for_short_inputs,
             remove_semicolons=model.remove_semicolons)
-        for chunk in chunks:
+        for n, chunk in enumerate(chunks):
             if cancel.is_set():
                 return
             prompt, guess = prepare_text_prompt(
@@ -465,15 +526,21 @@ class Engine:
             frames_after_eos = model.model_recommended_frames_after_eos
             if frames_after_eos is None:
                 frames_after_eos = guess + 2
+            # Later chunks keep their opening silence: it is the pause
+            # between sentences.
             yield from self._stream_one(model_state, prompt,
-                                        frames_after_eos, cancel)
+                                        frames_after_eos, cancel,
+                                        trim_silence=n == 0)
 
-    def _stream_one(self, model_state, text, frames_after_eos, cancel):
+    def _stream_one(self, model_state, text, frames_after_eos, cancel,
+                    trim_silence=False):
         """Cancellable re-implementation of pocket-tts
         _generate_audio_stream_short_text (pinned to pocket-tts 3.0.2, plus
         the MIN_FRAMES_BEFORE_EOS guard from 3.2.0): latents are produced on
         this thread and decoded by a worker so throughput matches upstream,
-        but both loops watch `cancel`."""
+        but both loops watch `cancel`. The end-of-speech signal counts only
+        once speech has been heard, and with `trim_silence` the silence
+        before it is dropped (see SPEECH_DBFS)."""
         import copy as _copy
         import queue as _queue
 
@@ -498,8 +565,13 @@ class Engine:
 
         latents_q = _queue.Queue()
         out_q = _queue.Queue()
+        onset = _SpeechOnset()
 
+        # Gradient tracking is per thread, so the decoder thread needs its
+        # own no_grad, as upstream's _decode_audio_worker has.
+        @torch.no_grad()
         def decoder():
+            silence = []    # frames before speech, held back
             try:
                 mimi_state = init_states(model.mimi, batch_size=1,
                                          sequence_length=mimi_seq_len)
@@ -513,11 +585,25 @@ class Engine:
                         decoding_input, mimi_state)
                     increment_steps(model.mimi, mimi_state,
                                     increment=mimi_steps)
-                    pcm = (frame[0, 0].clamp(-1, 1) * 32767).short()
-                    out_q.put(("chunk", pcm.numpy().tobytes()))
+                    samples = frame[0, 0].clamp(-1, 1)
+                    onset.add(samples)
+                    pcm = (samples * 32767).short().numpy().tobytes()
+                    if trim_silence and onset.frame is None:
+                        silence.append(pcm)
+                        continue
+                    for held in silence[-FRAMES_BEFORE_SPEECH_KEPT:]:
+                        out_q.put(("chunk", held))
+                    silence.clear()
+                    out_q.put(("chunk", pcm))
+                # Speech never measured: a voice too quiet for SPEECH_DBFS
+                # keeps all of its audio.
+                if not cancel.is_set():
+                    for held in silence:
+                        out_q.put(("chunk", held))
             except Exception as exc:   # noqa: BLE001
                 out_q.put(("error", exc))
             finally:
+                onset.close()
                 out_q.put(("done", None))
 
         decoder_thread = threading.Thread(target=decoder, daemon=True)
@@ -539,7 +625,11 @@ class Engine:
                                 model_state=model_state,
                                 backbone_input_latents=backbone)
                         if (is_eos.item() and eos_step is None
-                                and step >= MIN_FRAMES_BEFORE_EOS):
+                                and step >= MIN_FRAMES_BEFORE_EOS
+                                and (step >= FRAMES_BEFORE_EOS_WITHOUT_SPEECH
+                                     or onset.heard_by(
+                                         step - SPEECH_FRAMES_BEFORE_EOS,
+                                         cancel))):
                             eos_step = step
                         if (eos_step is not None
                                 and step >= eos_step + frames_after_eos):
@@ -571,8 +661,9 @@ class Engine:
             producer_thread.join(timeout=10)
             decoder_thread.join(timeout=10)
 
-    def speak(self, voice_name, text, cancel, emit):
-        """Generate `text` with `voice_name`, calling emit(pcm_bytes)."""
+    def speak(self, voice_name, text, cancel, emit, spell=False):
+        """Generate `text` with `voice_name`, calling emit(pcm_bytes). With
+        `spell`, each character is named rather than the text read."""
         if self.model is None:
             raise RuntimeError(self.load_error or "model not loaded")
         t0 = time.monotonic()
@@ -584,7 +675,7 @@ class Engine:
             if cancel.is_set():
                 logger.debug("speak cancelled before generation started")
                 return
-            for pcm in self._stream_chunks(state, text, cancel):
+            for pcm in self._stream_chunks(state, text, cancel, spell):
                 if cancel.is_set():
                     break
                 emitted += len(pcm)
@@ -1479,10 +1570,13 @@ class Connection:
     def handle_speak(self, payload):
         try:
             voice, offset = _read_str16(payload, 0)
-            text, _ = _read_str32(payload, offset)
+            text, offset = _read_str32(payload, offset)
         except (struct.error, IndexError):
             self.send_text(RESP_ERROR, "malformed SPEAK payload")
             return
+        # Engines before 1.2.2 send no flags byte.
+        flags = payload[offset] if offset < len(payload) else 0
+        spell = bool(flags & SPEAK_SPELL)
         # A previous utterance on this connection must be finished or
         # cancelled before a new one starts.
         if self.speak_thread and self.speak_thread.is_alive():
@@ -1494,7 +1588,7 @@ class Connection:
         def work():
             try:
                 ENGINE.speak(voice, text, cancel,
-                             lambda pcm: self.send(RESP_AUDIO, pcm))
+                             lambda pcm: self.send(RESP_AUDIO, pcm), spell)
                 self.send(RESP_AUDIO_END, SPEED.packed())
             except Exception as exc:   # noqa: BLE001
                 logger.exception("speak failed")

@@ -13,7 +13,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pockettts_text import cardinal, expand_numbers   # noqa: E402
+from pockettts_text import (   # noqa: E402
+    cardinal, character_name, expand_numbers, speakable)
+
+# A name is plain words: nothing for the model to say letter by letter.
+WORDS = r"^[a-z]+(?:[ -][a-z]+)*$"
+# A letter's name may also be the capital letter, as E and X are.
+LETTER = r"^(?:[a-z]+(?:[ -][a-z]+)*|[A-Z])$"
 
 
 class Cardinal(unittest.TestCase):
@@ -456,6 +462,100 @@ class LeftAlone(unittest.TestCase):
                      "555-123-4567", "2026-09-30", "1,234.5 and 50%"]:
             once = expand_numbers(text)
             self.assertEqual(expand_numbers(once), once)
+
+
+class ReportedLetters(unittest.TestCase):
+    """Issue #3: a letter on its own, as a screen reader sends it while the
+    user arrows through text, was garbled ("s" sounded like "Sess")."""
+
+    def test_the_reported_letter(self):
+        self.assertEqual(speakable("s"), "ess")
+        self.assertEqual(speakable("S"), "ess")
+
+    def test_every_letter_has_a_name_in_either_case(self):
+        names = set()
+        for code in range(ord("a"), ord("z") + 1):
+            lower, upper = chr(code), chr(code).upper()
+            self.assertRegex(speakable(lower), LETTER, lower)
+            self.assertNotEqual(speakable(lower), lower)
+            self.assertEqual(speakable(upper), speakable(lower))
+            names.add(speakable(lower))
+        self.assertEqual(len(names), 26)
+
+    def test_digits(self):
+        for digit, word in enumerate(["zero", "one", "two", "three", "four",
+                                      "five", "six", "seven", "eight",
+                                      "nine"]):
+            self.assertEqual(speakable(str(digit)), word)
+
+    def test_every_ascii_mark_has_a_name(self):
+        for char in "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~":
+            self.assertRegex(speakable(char), WORDS, char)
+
+    def test_other_marks_and_symbols(self):
+        self.assertEqual(speakable("…"), "ellipsis")
+        self.assertEqual(speakable("—"), "em dash")
+        self.assertEqual(speakable("“"), "left quote")
+        self.assertEqual(speakable("→"), "rightwards arrow")
+        self.assertEqual(speakable("✓"), "check mark")
+
+    def test_accented_and_greek_letters(self):
+        self.assertEqual(speakable("é"), character_name("e") + " acute")
+        self.assertEqual(speakable("Ñ"), character_name("n") + " tilde")
+        self.assertEqual(speakable("ü"), character_name("u") + " diaeresis")
+        self.assertEqual(speakable("α"), "alpha")
+
+    def test_surrounding_space(self):
+        self.assertEqual(speakable(" s "), "ess")
+        self.assertEqual(speakable("s\r\n"), "ess")
+        self.assertEqual(speakable(" ,"), "comma")
+
+    def test_a_letter_ending_a_sentence(self):
+        self.assertEqual(speakable("s."), "ess.")
+        self.assertEqual(speakable("S?"), "ess?")
+        self.assertEqual(speakable("cap s,"), "cap, ess,")
+        self.assertEqual(speakable("é."), character_name("é") + ".")
+        # Only a letter: these are marks of their own.
+        self.assertEqual(speakable(",."), ",.")
+        self.assertEqual(speakable("5."), "five.")
+
+    def test_cap(self):
+        # NVDA, set to say "cap" before a capital, sends "cap S". Without the
+        # comma the two ran together into "Cappas".
+        self.assertEqual(speakable("cap S"), "cap, ess")
+        self.assertEqual(speakable("Cap q"), "Cap, " + character_name("q"))
+
+    def test_spelling(self):
+        # SAPI's SpellOut action; the engine spaces the characters out.
+        self.assertEqual(speakable("a b c ", True),
+                         ", ".join(character_name(c) for c in "abc"))
+        self.assertEqual(speakable("Hi!", True),
+                         character_name("h") + ", " + character_name("i")
+                         + ", exclamation mark")
+        self.assertEqual(speakable("s ", True), "ess")
+        self.assertEqual(speakable("2 2 4 ", True), "two, two, four")
+
+    def test_words_are_not_spelled(self):
+        for text in ["Hello", "OK", "a b", "I am", "A cat", "x = y", "cap",
+                     "caps lock", "Save As...", "s..", "s. t.", "page 2"]:
+            self.assertNotIn(character_name("s"), speakable(text).split())
+        self.assertEqual(speakable("Page 224"), "Page two hundred twenty-four")
+        self.assertEqual(speakable("Hello, world."), "Hello, world.")
+
+    def test_names_the_model_says_as_another_word(self):
+        self.assertEqual(speakable("left paren"), "left puh-ren")
+        self.assertEqual(speakable("Right paren"), "Right puh-ren")
+        self.assertEqual(speakable("("), "left parenthesis")
+        self.assertEqual(speakable("colon"), "co-lon")
+        self.assertEqual(speakable(":"), "co-lon")
+        self.assertEqual(speakable("^"), "carrot")
+        self.assertEqual(speakable("a colon b"), "a co-lon b")
+        for text in ["semicolon", "colonel", "parent", "carets", "Colonial"]:
+            self.assertEqual(speakable(text), text)
+
+    def test_unnamed_characters_are_left_alone(self):
+        for char in ["中", "ß", "́"]:
+            self.assertEqual(speakable(char), char)
 
 
 if __name__ == "__main__":
