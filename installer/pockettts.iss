@@ -8,7 +8,7 @@
 ;                                           (installer\prepare_voices.py)
 
 #define MyAppName "Pocket TTS SAPI5"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Josh Kennedy"
 
 [Setup]
@@ -42,13 +42,22 @@ Source: "..\output\x64\PocketTTSSAPI.dll"; DestDir: "{app}\x64"; Flags: ignoreve
 Source: "..\output\PocketTTSVoiceManager.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\host\pockettts_host.py"; DestDir: "{app}\host"; Flags: ignoreversion
 Source: "..\host\pockettts_text.py"; DestDir: "{app}\host"; Flags: ignoreversion
+Source: "..\host\pockettts_models.py"; DestDir: "{app}\host"; Flags: ignoreversion
+Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs
-; AI model (large). Overwritten on upgrade; the Voice Manager can update it later.
+; AI models: the standard English model and the fast 7M one (large).
+; Overwritten on upgrade; the Voice Manager downloads, updates and removes models.
 Source: "staging\models\*"; DestDir: "{commonappdata}\PocketTTS\models"; Flags: ignoreversion recursesubdirs
 ; Default voices. The voice list itself is only written on a fresh install so
-; upgrades never clobber the user's cloned voices.
+; upgrades never clobber the user's cloned voices; defaults.ini (always
+; written) lets the engine add default voices that are new in this version.
 Source: "staging\voices\*"; DestDir: "{commonappdata}\PocketTTS\voices"; Excludes: "voices.ini"; Flags: ignoreversion recursesubdirs
 Source: "staging\voices\voices.ini"; DestDir: "{commonappdata}\PocketTTS\voices"; Flags: onlyifdoesntexist uninsneveruninstall
+
+[InstallDelete]
+; Before 1.3.0 the standard model used a SentencePiece tokenizer; its
+; October 2026 version reads tokenizer.json instead.
+Type: files; Name: "{commonappdata}\PocketTTS\models\english\tokenizer.model"
 
 [Registry]
 ; Voice packages open in the Voice Manager, so a shared file can simply be
@@ -65,6 +74,7 @@ Name: "{commonappdata}\PocketTTS\voices"; Permissions: users-modify
 
 [Icons]
 Name: "{autoprograms}\Pocket TTS Voice Manager"; Filename: "{app}\PocketTTSVoiceManager.exe"
+Name: "{autoprograms}\Pocket TTS What's New"; Filename: "{win}\notepad.exe"; Parameters: """{app}\CHANGELOG.md"""
 Name: "{autodesktop}\Pocket TTS Voice Manager"; Filename: "{app}\PocketTTSVoiceManager.exe"; Tasks: desktopicon
 Name: "{commonstartup}\Pocket TTS Engine"; Filename: "{app}\runtime\PocketTTSHost.exe"; Parameters: """{app}\host\pockettts_host.py"""; Tasks: startupengine
 

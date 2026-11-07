@@ -31,6 +31,7 @@ from pathlib import Path
 # leaves the folder of the script off sys.path, so the module that sits next
 # to this file would not be found without this.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pockettts_models as catalog  # noqa: E402
 from pockettts_text import speakable  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -59,16 +60,28 @@ MODELS_DIR = DATA_DIR / "models"
 VOICES_DIR = DATA_DIR / "voices"
 VOICES_SRC_DIR = VOICES_DIR / "src"
 VOICES_INI = VOICES_DIR / "voices.ini"
-# SHA-256 of the model weights the voices were last built with.
+# SHA-256 of the model weights the voices were built with, before 1.3.0 kept
+# it per voice. Read once, for voices that have no model_sha256 of their own.
 VOICES_MODEL_STAMP = VOICES_DIR / "model.sha256"
-CONFIG_YAML = MODELS_DIR / "english" / "config.yaml"
+# Engine options the Voice Manager sets (see Settings).
+SETTINGS_FILE = DATA_DIR / "engine.json"
 
 PORTS = (17853, 17854, 17855, 17856, 17857)
 PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
+
+# How a voice's embedding is made from its audio sample. 1: pocket-tts 3.0.2.
+# 2: pocket-tts 4.x, which ends the sample on a short pause first, so the
+# model does not carry on the sample's last word at the start of every chunk.
+# A voice built with an older recipe is rebuilt from its sample.
+EMBEDDING_RECIPE = 2
+
+# Models kept in memory at once. The standard model takes about 500 MB of
+# RAM, a small one far less; the least recently used one is let go.
+MAX_LOADED_MODELS = 3
 
 # Commands
 CMD_PING = 0
@@ -84,6 +97,11 @@ CMD_INFO = 9
 CMD_EXPORT_VOICES = 10
 CMD_IMPORT_VOICES = 11
 CMD_INSPECT_PACKAGE = 12
+CMD_LIST_MODELS = 13
+CMD_REMOVE_MODEL = 14
+CMD_SET_VOICE_MODEL = 15
+CMD_GET_SETTINGS = 16
+CMD_SET_SETTINGS = 17
 
 # CMD_SPEAK flags
 SPEAK_SPELL = 1   # name each character (SAPI's SpellOut action)
@@ -98,6 +116,8 @@ RESP_PONG = 5
 RESP_PROGRESS = 6
 RESP_INFO = 7
 RESP_PACKAGE = 8
+RESP_MODELS = 9
+RESP_SETTINGS = 10
 
 # The model's native output format, matching src/host_protocol.h.
 POCKETTTS_SAMPLE_RATE = 24000
@@ -114,7 +134,10 @@ logger = logging.getLogger("pockettts_host")
 # produced with: a voice only sounds right on the model that made it, so an
 # import re-embeds from the audio sample whenever the two models differ.
 
-PACKAGE_FORMAT = 1
+# Format 2 adds each voice's AI model (model_id, model_sha256). It is only
+# written when a voice uses a model other than the standard English one, so
+# a package of standard voices still opens in versions before 1.3.0.
+PACKAGE_FORMAT = 2
 PACKAGE_KIND = "pocket-tts-voice-package"
 PACKAGE_EXT = ".pttsvoices"
 PACKAGE_MANIFEST = "manifest.json"
@@ -324,172 +347,315 @@ class _SpeechOnset:
             return self.frame is not None and self.frame <= frame
 
 
-def _use_trained_gelu():
-    """Kyutai trained the released weights with the tanh approximation of
-    GELU, but pocket-tts 3.0.2 computes the exact GELU in the transformer
-    feed-forward block. pocket-tts 3.1.0 switched to the tanh form
-    (kyutai-labs/pocket-tts#278); the bundled 3.0.2 does the same here."""
-    import torch.nn.functional as F
-    from pocket_tts.modules.transformer import StreamingTransformerLayer
+class Settings:
+    """Engine options, kept in engine.json in the data folder.
 
-    def _ff_block(self, x):
-        x_orig = x
-        x = self.norm2(x)
-        update = self.linear2(F.gelu(self.linear1(x), approximate="tanh"))
-        return x_orig.to(update) + self.layer_scale_2(update)
+    quantize      int8 weights for the model's transformer: Kyutai measured
+                  about 27% faster on x86 with no loss of intelligibility.
+    continuation  each piece of a long text is generated as a continuation
+                  of the piece before it, instead of starting afresh from the
+                  voice sample, so a long passage keeps one flow (pocket-tts
+                  4.x's teacher_force_previous_chunk).
+    """
 
-    StreamingTransformerLayer._ff_block = _ff_block
+    DEFAULTS = {"quantize": False, "continuation": False}
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.values = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict):
+            with self.lock:
+                for key in self.DEFAULTS:
+                    if isinstance(data.get(key), bool):
+                        self.values[key] = data[key]
+
+    def save(self):
+        with self.lock:
+            text = json.dumps(self.values, indent=2)
+        tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
+
+    def get(self, key) -> bool:
+        with self.lock:
+            return bool(self.values[key])
+
+    def set(self, key, value: bool):
+        with self.lock:
+            self.values[key] = bool(value)
+
+
+SETTINGS = Settings()
+
+
+def voice_model_id(props: dict) -> str:
+    """The AI model a voice was made with; voices from before 1.3.0 were all
+    made with the standard English model."""
+    model_id = props.get("model") or catalog.STANDARD_MODEL
+    return model_id if model_id in catalog.BY_ID else catalog.STANDARD_MODEL
+
+
+def _legacy_stamp() -> str:
+    try:
+        return VOICES_MODEL_STAMP.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
+
+
+def _spell_plain(text: str) -> str:
+    """Spelling for a language the English character names do not suit."""
+    return ", ".join(c for c in text if not c.isspace())
 
 
 class Engine:
     def __init__(self):
-        self.model = None
+        self.models = {}                   # model id -> loaded TTSModel
+        self.model_order = []              # least recently used first
+        self.models_lock = threading.RLock()
         self.gen_lock = threading.Lock()   # pocket-tts is not thread-safe
-        self.state_cache = {}              # voice name -> model state
+        self.state_cache = {}              # voice name -> (model id, state)
         self.state_cache_order = []
-        self.load_error = None
+        self.load_errors = {}              # model id -> why it did not load
+
+    # -- models -------------------------------------------------------------
+
+    @property
+    def load_error(self):
+        return self.load_errors.get(catalog.STANDARD_MODEL)
 
     def load(self):
+        """Load the standard model at start-up. Everything else loads when a
+        voice first needs it."""
         try:
-            from pocket_tts import TTSModel
-            _use_trained_gelu()
-            if not CONFIG_YAML.exists():
-                raise FileNotFoundError(
-                    f"Model config not found: {CONFIG_YAML}. "
-                    "Reinstall or run a model update.")
-            self._fix_config_paths()
-            t0 = time.monotonic()
-            self.model = TTSModel.load_model(config=str(CONFIG_YAML))
-            logger.info("model loaded in %.1fs (voice cloning: %s)",
-                        time.monotonic() - t0, self.model.has_voice_cloning)
-            self.load_error = None
-        except Exception as exc:
-            logger.exception("model load failed")
-            self.load_error = str(exc)
+            self.model_for(catalog.STANDARD_MODEL)
+        except Exception:   # noqa: BLE001
+            pass    # logged, and kept in load_errors for the Voice Manager
 
-    def _fix_config_paths(self):
-        """The bundled config references C:/ProgramData/PocketTTS; rewrite it
-        when the data directory lives elsewhere (relocated ProgramData or a
-        POCKETTTS_DATA_DIR override)."""
-        canonical = "C:/ProgramData/PocketTTS"
-        actual = str(DATA_DIR).replace("\\", "/")
-        if actual.lower() == canonical.lower():
-            return
+    def model_for(self, model_id: str):
+        """The loaded model `model_id`, loading it first if need be."""
+        with self.models_lock:
+            model = self.models.get(model_id)
+            if model is not None:
+                self.model_order.remove(model_id)
+                self.model_order.append(model_id)
+                return model
+            model = self._load_model(model_id)
+            self.models[model_id] = model
+            self.model_order.append(model_id)
+            while len(self.model_order) > MAX_LOADED_MODELS:
+                evicted = self.model_order.pop(0)
+                self.models.pop(evicted, None)
+                self._drop_states_of(evicted)
+                logger.info("let go of model %s to save memory", evicted)
+            return model
+
+    def _load_model(self, model_id: str):
+        from pocket_tts import TTSModel
+        info = catalog.get(model_id)
+        if not catalog.is_installed(MODELS_DIR, model_id):
+            error = (f'The AI model "{info.title}" is not installed. Download '
+                     "it in the Voice Manager, under AI Models.")
+            self.load_errors[model_id] = error
+            raise FileNotFoundError(error)
+        config = str(catalog.config_file(MODELS_DIR, model_id))
+        quantize = SETTINGS.get("quantize")
+        t0 = time.monotonic()
         try:
-            text = CONFIG_YAML.read_text(encoding="utf-8")
-            if canonical in text:
-                CONFIG_YAML.write_text(
-                    text.replace(canonical, actual), encoding="utf-8")
-                logger.info("rewrote model config paths to %s", actual)
-        except OSError:
-            logger.warning("could not rewrite config paths", exc_info=True)
+            try:
+                model = TTSModel.load_model(config=config, quantize=quantize)
+            except Exception:   # noqa: BLE001
+                if not quantize:
+                    raise
+                logger.exception("int8 quantization failed for %s; loading "
+                                 "it at full precision", model_id)
+                model = TTSModel.load_model(config=config)
+        except Exception as exc:
+            logger.exception("model %s failed to load", model_id)
+            self.load_errors[model_id] = str(exc)
+            raise
+        self.load_errors.pop(model_id, None)
+        # The English text rules (numbers, letter names) apply to English
+        # models only.
+        model._pockettts_english = info.english
+        logger.info("model %s loaded in %.1fs (voice cloning: %s, int8: %s)",
+                    model_id, time.monotonic() - t0, model.has_voice_cloning,
+                    quantize)
+        return model
+
+    def unload(self, model_id=None):
+        """Forget one loaded model, or all of them, and their voices."""
+        with self.models_lock:
+            ids = [model_id] if model_id else list(self.models)
+            for mid in ids:
+                self.models.pop(mid, None)
+                if mid in self.model_order:
+                    self.model_order.remove(mid)
+                self._drop_states_of(mid)
+
+    def loaded_ids(self):
+        with self.models_lock:
+            return list(self.models)
 
     def after_load(self):
-        """Background work once the model is loaded: bring the voices in
-        line with it, then warm up."""
+        """Background work once the standard model is loaded: bring every
+        voice in line with its model, then warm up."""
         try:
-            self.sync_voices_with_model()
+            add_new_default_voices()
+        except Exception:
+            logger.exception("adding the new default voices failed "
+                             "(non-fatal)")
+        try:
+            self.sync_voices_with_models()
         except Exception:
             logger.exception("voice rebuild failed (non-fatal)")
         self.warm_up()
 
-    def sync_voices_with_model(self):
-        """A voice only sounds right on the weights that built it. When the
-        model differs from the one the voices were last built with (a new
-        version installed over an old one, or model files replaced by hand),
-        rebuild them from their audio samples."""
-        if self.model is None or not self.model.has_voice_cloning:
-            return
-        current = _model_fingerprint().get("sha256")
-        try:
-            recorded = VOICES_MODEL_STAMP.read_text(encoding="ascii").strip()
-        except OSError:
-            recorded = ""
-        if not current or recorded == current:
-            return
-        logger.info("voices were built with model %s, the model is now %s; "
-                    "rebuilding them", recorded[:12] or "(unrecorded)",
-                    current[:12])
-        self.rebuild_voices(lambda msg: logger.info("voices: %s", msg))
+    # -- voices and their models -------------------------------------------
 
-    def rebuild_voices(self, progress):
-        """Re-embed every voice that still has its audio sample with the
-        loaded model, and record that model as the voices' model."""
+    def sync_voices_with_models(self):
+        """A voice only sounds right on the weights that built it. When a
+        model differs from the one its voices were last built with (a new
+        version installed over an old one, model files replaced by hand), or
+        the voices were embedded the way an older version did it, they are
+        rebuilt from their audio samples."""
+        voices = STORE.read()
+        legacy = _legacy_stamp()
+        by_model = {}
+        for name, props in voices.items():
+            by_model.setdefault(voice_model_id(props), []).append(name)
+        for model_id, names in by_model.items():
+            if not catalog.is_installed(MODELS_DIR, model_id):
+                logger.warning("voices %s need model %s, which is not "
+                               "installed", names, model_id)
+                continue
+            current = _model_fingerprint(model_id).get("sha256")
+            stale = []
+            for name in names:
+                props = voices[name]
+                built_with = props.get("model_sha256") or legacy
+                recipe = _int(props.get("embedding"), 1)
+                if built_with != current or recipe < EMBEDDING_RECIPE:
+                    stale.append(name)
+            if stale:
+                logger.info("rebuilding %d voice(s) for model %s (%s): %s",
+                            len(stale), model_id, current[:12],
+                            ", ".join(stale))
+                self.rebuild_voices(stale,
+                                    lambda msg: logger.info("voices: %s", msg))
+
+    def rebuild_voices(self, names, progress):
+        """Re-embed the named voices from their audio samples with each
+        one's own model, and record that model in voices.ini."""
         from pocket_tts.models.model_state import export_model_state
-        for name, props in STORE.read().items():
+        voices = STORE.read()
+        for name in names:
+            props = voices.get(name)
+            if props is None:
+                continue
+            model_id = voice_model_id(props)
+            current = _model_fingerprint(model_id).get("sha256", "")
             source = props.get("source", "")
-            if not source:
-                progress(f'Voice "{name}" has no source audio; leaving as is.')
+            src = (VOICES_DIR / source) if source else None
+            if src is None or not src.exists():
+                if props.get("model_sha256", _legacy_stamp()) == current:
+                    # Same weights, older recipe: the voice still works as it
+                    # is, and there is nothing to rebuild it from.
+                    _mark_built(name, model_id, current)
+                    continue
+                progress(f'Voice "{name}" has no audio sample to rebuild it '
+                         "from; leaving it as it is.")
                 continue
-            src = VOICES_DIR / source
-            if not src.exists():
-                progress(f'Source audio for "{name}" is missing; leaving as is.')
-                continue
-            progress(f'Rebuilding voice "{name}" for the new model...')
+            progress(f'Rebuilding voice "{name}" for its AI model...')
             dest = VOICES_DIR / props.get("file", name + ".safetensors")
             tmp = dest.with_name(dest.name + ".new")
             try:
+                model = self.model_for(model_id)
                 with self.gen_lock:
-                    state = self.model.get_state_for_audio_prompt(
-                        src, truncate=True)
-                # Replaced in one step: a voice may be loaded to speak meanwhile.
+                    state = model.get_state_for_audio_prompt(src,
+                                                             truncate=True)
+                # Replaced in one step: the voice may be loaded to speak.
                 export_model_state(state, tmp)
                 os.replace(tmp, dest)
             except Exception:   # noqa: BLE001
                 logger.exception("could not rebuild voice %r", name)
-                progress(f'Could not rebuild voice "{name}"; leaving as is.')
-        self.clear_cache()
-        sha = _model_fingerprint().get("sha256")
-        if sha:
-            try:
-                VOICES_MODEL_STAMP.write_text(sha + "\n", encoding="ascii")
-            except OSError:
-                logger.warning("could not record the voices' model",
-                               exc_info=True)
+                progress(f'Could not rebuild voice "{name}"; leaving it as '
+                         "it is.")
+                continue
+            self.drop_cached_state(name)
+            _mark_built(name, model_id, current)
 
     def warm_up(self):
         """First generation initialises lazy torch state; do it off the
-        critical path so the first real utterance is fast."""
+        critical path so the first real utterance is fast. Every model a
+        published voice uses is loaded here too, up to MAX_LOADED_MODELS."""
         try:
             voices = STORE.read()
-            name = next(iter(voices), None)
-            if name is None:
-                return
-            state = self.get_voice_state(name, voices)
-            produced = 0
-            t0 = time.monotonic()
-            with self.gen_lock:
-                for pcm in self._stream_chunks(state, "Ready.",
-                                               threading.Event()):
-                    produced += len(pcm)
-            audio_ms = produced / 2 / POCKETTTS_SAMPLE_RATE * 1000
-            SPEED.update(audio_ms, (time.monotonic() - t0) * 1000)
-            logger.info("warm-up generation done (machine x%.2f realtime)",
-                        SPEED.get())
+            first = {}
+            for name, props in voices.items():
+                if props.get("published", "0") == "1":
+                    first.setdefault(voice_model_id(props), name)
+            if not first and voices:
+                name = next(iter(voices))
+                first[voice_model_id(voices[name])] = name
+            for model_id, name in list(first.items())[:MAX_LOADED_MODELS]:
+                if not catalog.is_installed(MODELS_DIR, model_id):
+                    continue
+                state, model = self.get_voice_state(name, voices)
+                produced = 0
+                t0 = time.monotonic()
+                with self.gen_lock:
+                    for pcm in self._stream_chunks(model, state, "Ready.",
+                                                   threading.Event()):
+                        produced += len(pcm)
+                audio_ms = produced / 2 / POCKETTTS_SAMPLE_RATE * 1000
+                if model_id == catalog.STANDARD_MODEL or SPEED.get() <= 0:
+                    SPEED.update(audio_ms, (time.monotonic() - t0) * 1000)
+                logger.info("warm-up of %s done (x%.2f realtime)", model_id,
+                            audio_ms / max(1.0, (time.monotonic() - t0) * 1000))
         except Exception:
             logger.exception("warm-up failed (non-fatal)")
 
     def get_voice_state(self, name: str, voices: dict):
-        if name in self.state_cache:
-            return self.state_cache[name]
+        """(voice state, model) for the voice `name`."""
         props = voices.get(name)
         if props is None:
             raise KeyError(f"unknown voice: {name}")
+        model_id = voice_model_id(props)
+        model = self.model_for(model_id)
+        cached = self.state_cache.get(name)
+        if cached is not None and cached[0] == model_id:
+            return cached[1], model
         path = VOICES_DIR / props.get("file", name + ".safetensors")
         if not path.exists():
             raise FileNotFoundError(f"voice file missing: {path}")
-        state = self.model.get_state_for_audio_prompt(path)
-        self.state_cache[name] = state
+        state = model.get_state_for_audio_prompt(path)
+        self._cache_state(name, model_id, state)
+        return state, model
+
+    def _cache_state(self, name, model_id, state):
+        self.drop_cached_state(name)
+        self.state_cache[name] = (model_id, state)
         self.state_cache_order.append(name)
         while len(self.state_cache_order) > 6:
             evicted = self.state_cache_order.pop(0)
             self.state_cache.pop(evicted, None)
-        return state
 
     def drop_cached_state(self, name: str):
         self.state_cache.pop(name, None)
         if name in self.state_cache_order:
             self.state_cache_order.remove(name)
+
+    def _drop_states_of(self, model_id):
+        for name, (mid, _) in list(self.state_cache.items()):
+            if mid == model_id:
+                self.drop_cached_state(name)
 
     def clear_cache(self):
         self.state_cache.clear()
@@ -497,50 +663,77 @@ class Engine:
 
     # -- generation ---------------------------------------------------------
 
-    def _stream_chunks(self, model_state, text, cancel, spell=False):
+    def _stream_chunks(self, model, model_state, text, cancel, spell=False):
         """Yield int16 PCM byte chunks; honours `cancel` between model steps
         so screen-reader interruptions take effect within ~one frame."""
-        from pocket_tts.default_parameters import MAX_TOKEN_PER_CHUNK
+        import torch
+        from pocket_tts.default_parameters import (
+            MAX_TOKEN_PER_CHUNK, MAX_TOKEN_PER_CHUNK_TEACHER_FORCED)
         from pocket_tts.models.text_chunking import (
             prepare_text_prompt, split_into_best_sentences)
 
-        # The model has no tokens for numbers and mangles digit strings ("224"
-        # was heard as "24"), and it garbles a letter or a symbol said on its
-        # own, so those are written out in words first.
-        spoken = speakable(text, spell)
+        # The English model has no tokens for numbers and mangles digit
+        # strings ("224" was heard as "24"), and it garbles a letter or a
+        # symbol said on its own, so those are written out in words first.
+        # The rules are English, so other languages get the text as it is.
+        if _model_is_english(model):
+            spoken = speakable(text, spell)
+        else:
+            spoken = _spell_plain(text) if spell else text
         if spoken != text:
             logger.debug("written out: %r -> %r", text, spoken)
             text = spoken
+        if not text.strip():
+            return
 
-        model = self.model
+        continuation = SETTINGS.get("continuation")
+        options = (model.pad_with_spaces_for_short_inputs,
+                   model.remove_semicolons,
+                   model.append_terminal_punctuation,
+                   model.capitalize_first_letter,
+                   model.replace_characters)
         chunks = split_into_best_sentences(
-            model.flow_lm.conditioner.tokenizer, text, MAX_TOKEN_PER_CHUNK,
-            model.pad_with_spaces_for_short_inputs,
-            remove_semicolons=model.remove_semicolons)
+            model.flow_lm.conditioner.tokenizer, text,
+            (MAX_TOKEN_PER_CHUNK_TEACHER_FORCED if continuation
+             else MAX_TOKEN_PER_CHUNK),
+            options[0], *options[1:])
+        previous_chunk = None
+        previous_latents = []
         for n, chunk in enumerate(chunks):
             if cancel.is_set():
                 return
-            prompt, guess = prepare_text_prompt(
-                chunk, model.pad_with_spaces_for_short_inputs,
-                model.remove_semicolons)
+            forced = None
+            text_chunk = chunk
+            if continuation and previous_latents:
+                # The next piece is generated as the continuation of this
+                # one: its text follows on from the previous piece's, and the
+                # previous piece's frames are fed back in first.
+                forced = torch.cat(previous_latents, dim=1)
+                text_chunk = f"{previous_chunk} {chunk}"
+            previous_chunk, previous_latents = chunk, []
+            prompt, _ = prepare_text_prompt(text_chunk, *options)
+            _, guess = prepare_text_prompt(chunk, *options)
             frames_after_eos = model.model_recommended_frames_after_eos
             if frames_after_eos is None:
                 frames_after_eos = guess + 2
             # Later chunks keep their opening silence: it is the pause
             # between sentences.
-            yield from self._stream_one(model_state, prompt,
-                                        frames_after_eos, cancel,
-                                        trim_silence=n == 0)
+            yield from self._stream_one(
+                model, model_state, prompt, frames_after_eos, cancel,
+                trim_silence=n == 0,
+                latents_out=previous_latents if continuation else None,
+                forced=forced)
 
-    def _stream_one(self, model_state, text, frames_after_eos, cancel,
-                    trim_silence=False):
-        """Cancellable re-implementation of pocket-tts
-        _generate_audio_stream_short_text (pinned to pocket-tts 3.0.2, plus
-        the MIN_FRAMES_BEFORE_EOS guard from 3.2.0): latents are produced on
-        this thread and decoded by a worker so throughput matches upstream,
-        but both loops watch `cancel`. The end-of-speech signal counts only
-        once speech has been heard, and with `trim_silence` the silence
-        before it is dropped (see SPEECH_DBFS)."""
+    def _stream_one(self, model, model_state, text, frames_after_eos, cancel,
+                    trim_silence=False, latents_out=None, forced=None):
+        """Cancellable re-implementation of pocket-tts 4.x
+        _generate_audio_stream_short_text: latents are produced on one
+        thread and decoded by another, as upstream does, but both loops watch
+        `cancel`. The end-of-speech signal counts only once speech has been
+        heard, and with `trim_silence` the silence before it is dropped (see
+        SPEECH_DBFS). `forced` holds the previous piece's frames when this
+        piece continues it, and `latents_out` collects this piece's frames
+        for the next one."""
         import copy as _copy
         import queue as _queue
 
@@ -548,20 +741,38 @@ class Engine:
         from pocket_tts.modules.stateful_module import (
             increment_steps, init_states)
 
-        model = self.model
         model_state = _copy.deepcopy(model_state)
 
         prepared = model.flow_lm.conditioner.prepare(text)
-        token_count = prepared.tokens.shape[1]
+        token_count = prepared.shape[1]
+        n_forced = 0 if forced is None else forced.shape[1]
         max_gen_len = model._estimate_max_gen_len(token_count)
         mimi_steps = int(model.mimi.encoder_frame_rate / model.mimi.frame_rate)
-        mimi_seq_len = max_gen_len * mimi_steps
+        warmup = None
+        if forced is not None:
+            warmup = forced[:, -model._DECODER_WARMUP_FRAMES:]
+        n_warmup = 0 if warmup is None else warmup.shape[1]
+        mimi_seq_len = (max_gen_len + n_warmup) * mimi_steps
+        frame_samples = int(model.mimi.sample_rate / model.mimi.frame_rate)
+        sample_rate = model.mimi.sample_rate
 
         current_end = model._flow_lm_current_end(model_state)
         model._expand_kv_cache(
-            model_state, sequence_length=current_end + token_count + max_gen_len)
-        model._run_flow_lm_and_increment_step(
-            model_state=model_state, text_tokens=prepared.tokens)
+            model_state,
+            sequence_length=current_end + token_count + n_forced + max_gen_len)
+        first_input = None
+        if n_forced == 0:
+            model._run_flow_lm_and_increment_step(
+                model_state=model_state, text_tokens=prepared)
+        else:
+            # Teacher forcing: BOS, then every forced frame but the last,
+            # which is the input of the first generated step.
+            bos = torch.full_like(forced[:, :1], float("NaN"))
+            model._run_flow_lm_and_increment_step(
+                model_state=model_state, text_tokens=prepared,
+                backbone_input_latents=torch.cat([bos, forced[:, :-1]],
+                                                 dim=1))
+            first_input = forced[:, -1:]
 
         latents_q = _queue.Queue()
         out_q = _queue.Queue()
@@ -575,26 +786,63 @@ class Engine:
             try:
                 mimi_state = init_states(model.mimi, batch_size=1,
                                          sequence_length=mimi_seq_len)
-                while True:
-                    latent = latents_q.get()
-                    if latent is None or cancel.is_set():
-                        break
-                    decoding_input = (latent * model.flow_lm.emb_std
-                                      + model.flow_lm.emb_mean)
-                    frame = model.mimi.decode_from_latent(
-                        decoding_input, mimi_state)
+                # A fresh decoder puts a small step in its first samples,
+                # heard as a click: the first 5 ms are faded in, as
+                # pocket-tts 4.x does.
+                fade_in = torch.linspace(0, 1, sample_rate // 200)
+                if warmup is not None:
+                    # A continuation: the decoder runs over the end of the
+                    # previous piece first (audio dropped), so this piece's
+                    # audio follows on from it with no fresh-state click.
+                    model.mimi.decode_from_latent(
+                        warmup * model.flow_lm.emb_std
+                        + model.flow_lm.emb_mean, mimi_state)
                     increment_steps(model.mimi, mimi_state,
-                                    increment=mimi_steps)
-                    samples = frame[0, 0].clamp(-1, 1)
-                    onset.add(samples)
-                    pcm = (samples * 32767).short().numpy().tobytes()
-                    if trim_silence and onset.frame is None:
-                        silence.append(pcm)
-                        continue
-                    for held in silence[-FRAMES_BEFORE_SPEECH_KEPT:]:
-                        out_q.put(("chunk", held))
-                    silence.clear()
-                    out_q.put(("chunk", pcm))
+                                    increment=mimi_steps * warmup.shape[1])
+                    fade_in = None
+                finished = False
+                while not finished and not cancel.is_set():
+                    latent = latents_q.get()
+                    if latent is None:
+                        break
+                    # Every frame the generator has queued is decoded in one
+                    # call, as upstream does, so the decoder keeps up on
+                    # slower machines.
+                    latents = [latent]
+                    while True:
+                        try:
+                            nxt = latents_q.get_nowait()
+                        except _queue.Empty:
+                            break
+                        if nxt is None:
+                            finished = True
+                            break
+                        latents.append(nxt)
+                    decoding_input = (torch.cat(latents, dim=1)
+                                      * model.flow_lm.emb_std
+                                      + model.flow_lm.emb_mean)
+                    audio = model.mimi.decode_from_latent(decoding_input,
+                                                          mimi_state)
+                    increment_steps(model.mimi, mimi_state,
+                                    increment=mimi_steps * len(latents))
+                    if cancel.is_set():
+                        break
+                    samples = audio[0, 0].clamp(-1, 1)
+                    if fade_in is not None:
+                        n = min(fade_in.numel(), samples.shape[-1])
+                        samples[:n] *= fade_in[:n].to(samples)
+                        fade_in = None
+                    for start in range(0, samples.shape[-1], frame_samples):
+                        frame = samples[start:start + frame_samples]
+                        onset.add(frame)
+                        pcm = (frame * 32767).short().numpy().tobytes()
+                        if trim_silence and onset.frame is None:
+                            silence.append(pcm)
+                            continue
+                        for held in silence[-FRAMES_BEFORE_SPEECH_KEPT:]:
+                            out_q.put(("chunk", held))
+                        silence.clear()
+                        out_q.put(("chunk", pcm))
                 # Speech never measured: a voice too quiet for SPEECH_DBFS
                 # keeps all of its audio.
                 if not cancel.is_set():
@@ -612,10 +860,12 @@ class Engine:
         def producer():
             try:
                 with torch.no_grad():
-                    backbone = torch.full(
-                        (1, 1, model.flow_lm.ldim), float("NaN"),
-                        device=next(iter(model.flow_lm.parameters())).device,
-                        dtype=model.flow_lm.dtype)
+                    backbone = first_input
+                    if backbone is None:
+                        backbone = torch.full(
+                            (1, 1, model.flow_lm.ldim), float("NaN"),
+                            device=next(iter(model.flow_lm.parameters())).device,
+                            dtype=model.flow_lm.dtype)
                     eos_step = None
                     for step in range(max_gen_len):
                         if cancel.is_set():
@@ -627,13 +877,15 @@ class Engine:
                         if (is_eos.item() and eos_step is None
                                 and step >= MIN_FRAMES_BEFORE_EOS
                                 and (step >= FRAMES_BEFORE_EOS_WITHOUT_SPEECH
-                                     or onset.heard_by(
+                                                 or onset.heard_by(
                                          step - SPEECH_FRAMES_BEFORE_EOS,
                                          cancel))):
                             eos_step = step
                         if (eos_step is not None
                                 and step >= eos_step + frames_after_eos):
                             break
+                        if latents_out is not None:
+                            latents_out.append(next_latent)
                         latents_q.put(next_latent)
                         backbone = next_latent
             except Exception as exc:   # noqa: BLE001
@@ -664,18 +916,16 @@ class Engine:
     def speak(self, voice_name, text, cancel, emit, spell=False):
         """Generate `text` with `voice_name`, calling emit(pcm_bytes). With
         `spell`, each character is named rather than the text read."""
-        if self.model is None:
-            raise RuntimeError(self.load_error or "model not loaded")
         t0 = time.monotonic()
         voices = STORE.read()
-        state = self.get_voice_state(voice_name, voices)
+        state, model = self.get_voice_state(voice_name, voices)
         emitted = 0
         emit_seconds = 0.0
         with self.gen_lock:
             if cancel.is_set():
                 logger.debug("speak cancelled before generation started")
                 return
-            for pcm in self._stream_chunks(state, text, cancel, spell):
+            for pcm in self._stream_chunks(model, state, text, cancel, spell):
                 if cancel.is_set():
                     break
                 emitted += len(pcm)
@@ -698,12 +948,20 @@ class Engine:
 
     # -- cloning ------------------------------------------------------------
 
-    def clone(self, name, audio_path, gender, language, progress):
-        if self.model is None:
-            raise RuntimeError(self.load_error or "model not loaded")
-        if not self.model.has_voice_cloning:
+    def _embed(self, model_id, audio_path):
+        """A voice state for `audio_path` with the model `model_id`."""
+        model = self.model_for(model_id)
+        if not model.has_voice_cloning:
             raise RuntimeError(
                 "The installed model does not support voice cloning.")
+        with self.gen_lock:
+            return model.get_state_for_audio_prompt(Path(audio_path),
+                                                    truncate=True)
+
+    def clone(self, name, audio_path, gender, language, progress,
+              model_id=None):
+        model_id = model_id or catalog.STANDARD_MODEL
+        info = catalog.get(model_id)
         src = Path(audio_path)
         if not src.exists():
             raise FileNotFoundError(f"audio file not found: {src}")
@@ -711,88 +969,176 @@ class Engine:
         if not safe:
             raise ValueError("voice name is empty or invalid")
         voices = STORE.read()
-        if safe in voices:
+        if safe.lower() in {v.lower() for v in voices}:
             raise ValueError(f'a voice named "{safe}" already exists')
 
         from pocket_tts.models.model_state import export_model_state
-        progress("Analyzing the audio sample (this can take a minute)...")
-        with self.gen_lock:
-            state = self.model.get_state_for_audio_prompt(src, truncate=True)
+        progress(f"Analyzing the audio sample with {info.title} (this can "
+                 "take a minute)...")
+        state = self._embed(model_id, src)
         progress("Saving the voice...")
         VOICES_DIR.mkdir(parents=True, exist_ok=True)
         VOICES_SRC_DIR.mkdir(parents=True, exist_ok=True)
         export_model_state(state, VOICES_DIR / f"{safe}.safetensors")
         src_copy = VOICES_SRC_DIR / (safe + src.suffix.lower())
         shutil.copy(src, src_copy)
+        sha = _model_fingerprint(model_id).get("sha256", "")
 
         def mutate(voices):
             voices[safe] = {
                 "file": f"{safe}.safetensors",
                 "gender": "Female" if gender == 1 else "Male",
-                "language": language or "409",
+                # A voice speaks its model's language; the Clone dialog's
+                # choice is kept only for the English models.
+                "language": (_clean_language(language) if info.english
+                             else info.lcid),
                 "published": "0",
                 "source": f"src/{src_copy.name}",
+                "model": model_id,
+                "model_sha256": sha,
+                "embedding": str(EMBEDDING_RECIPE),
             }
         STORE.update(mutate)
-        self.state_cache[safe] = state
-        self.state_cache_order.append(safe)
+        self._cache_state(safe, model_id, state)
         return safe
 
-    # -- model update -------------------------------------------------------
+    def set_voice_model(self, name, model_id, copy_name, progress):
+        """Rebuild the voice `name` for another AI model from its audio
+        sample: in place, or, when `copy_name` is given, as a new voice of
+        that name, leaving the original as it is."""
+        info = catalog.get(model_id)
+        voices = STORE.read()
+        props = voices.get(name)
+        if props is None:
+            raise ValueError(f'no voice named "{name}"')
+        source = props.get("source", "")
+        src = (VOICES_DIR / source) if source else None
+        if src is None or not src.exists():
+            raise ValueError(f'"{name}" has no audio sample on this computer, '
+                             "so it cannot be made for another AI model. "
+                             "Clone it again from the original recording.")
+        if copy_name:
+            target = _sanitize_name(copy_name)
+            if not target:
+                raise ValueError("the new voice's name is empty or invalid")
+            if target.lower() in {v.lower() for v in voices}:
+                raise ValueError(f'a voice named "{target}" already exists')
+        else:
+            target = name
+            if voice_model_id(props) == model_id:
+                raise ValueError(f'"{name}" already uses {info.title}.')
 
-    def update_models(self, token, progress):
-        from huggingface_hub import hf_hub_download
+        from pocket_tts.models.model_state import export_model_state
+        progress(f'Making "{target}" with {info.title} (this can take a '
+                 "minute)...")
+        state = self._embed(model_id, src)
+        sha = _model_fingerprint(model_id).get("sha256", "")
+        language = (props.get("language", catalog.LCID_ENGLISH)
+                    if info.english else info.lcid)
+        if copy_name:
+            dest = VOICES_DIR / f"{target}.safetensors"
+            export_model_state(state, dest)
+            src_copy = VOICES_SRC_DIR / (target + src.suffix.lower())
+            shutil.copy(src, src_copy)
+
+            def mutate(voices):
+                voices[target] = {
+                    "file": dest.name,
+                    "gender": props.get("gender", "Male"),
+                    "language": language,
+                    "published": "0",
+                    "source": f"src/{src_copy.name}",
+                    "model": model_id,
+                    "model_sha256": sha,
+                    "embedding": str(EMBEDDING_RECIPE),
+                }
+        else:
+            dest = VOICES_DIR / props.get("file", name + ".safetensors")
+            tmp = dest.with_name(dest.name + ".new")
+            export_model_state(state, tmp)
+            os.replace(tmp, dest)
+
+            def mutate(voices):
+                if target in voices:
+                    voices[target].update({
+                        "language": language,
+                        "model": model_id,
+                        "model_sha256": sha,
+                        "embedding": str(EMBEDDING_RECIPE),
+                    })
+        STORE.update(mutate)
+        self._cache_state(target, model_id, state)
+        if copy_name:
+            return (f'Made "{target}" with {info.title}. It is not published '
+                    "yet: select it and choose Publish to SAPI.")
+        return f'"{target}" now uses {info.title}.'
+
+    # -- models: download, update, remove -----------------------------------
+
+    def update_models(self, token, progress, model_id=None):
+        """Download (or update) one AI model and rebuild its voices."""
         from huggingface_hub.utils import disable_progress_bars
 
         # No one can see a progress bar in the host; the Voice Manager shows
         # the progress messages instead.
         disable_progress_bars()
-        token = token or None
-        english = MODELS_DIR / "english"
-        english.mkdir(parents=True, exist_ok=True)
+        model_id = model_id or catalog.STANDARD_MODEL
+        info = catalog.get(model_id)
+        folder = catalog.download(MODELS_DIR, model_id, token or None,
+                                  progress)
 
-        progress("Downloading the latest English model from Hugging Face...")
-        model_file = hf_hub_download(
-            repo_id="kyutai/pocket-tts",
-            filename="languages/english/model.safetensors", token=token)
-        progress("Downloading the tokenizer...")
-        tok_file = hf_hub_download(
-            repo_id="kyutai/pocket-tts-without-voice-cloning",
-            filename="languages/english/tokenizer.model", token=token)
-
-        progress("Installing the new model files...")
-        # The previous files are kept as *.old until the new model loads.
-        installed = []
-        for src, name in ((model_file, "model.safetensors"),
-                          (tok_file, "tokenizer.model")):
-            dest = english / name
-            shutil.copy(src, english / (name + ".new"))
-            if dest.exists():
-                os.replace(dest, english / (name + ".old"))
-            os.replace(english / (name + ".new"), dest)
-            installed.append(dest)
-
-        progress("Loading the new model...")
-        with self.gen_lock:
-            self.clear_cache()
-            self.load()
-        # A failed load keeps the previous model in memory and sets load_error.
-        if self.model is None or self.load_error:
-            error = self.load_error
-            for dest in installed:
-                old = dest.with_name(dest.name + ".old")
-                if old.exists():
-                    os.replace(old, dest)
-            with self.gen_lock:
-                self.load()
-            raise RuntimeError("the new model failed to load, so the previous "
-                               f"one was kept: {error}")
-        for dest in installed:
-            dest.with_name(dest.name + ".old").unlink(missing_ok=True)
+        progress(f"Loading {info.title}...")
+        self.unload(model_id)
+        try:
+            self.model_for(model_id)
+        except Exception as exc:   # noqa: BLE001
+            catalog.roll_back(folder)
+            self.unload(model_id)
+            if catalog.is_installed(MODELS_DIR, model_id):
+                try:
+                    self.model_for(model_id)
+                except Exception:   # noqa: BLE001
+                    pass
+            raise RuntimeError("the new model failed to load, so the "
+                               f"previous one was kept: {exc}") from None
+        catalog.finish_install(folder)
 
         # Voice states are tied to the model weights.
-        self.rebuild_voices(progress)
-        progress("Model update complete.")
+        names = [n for n, p in STORE.read().items()
+                 if voice_model_id(p) == model_id]
+        if names:
+            self.rebuild_voices(names, progress)
+        progress(f"{info.title} is installed and ready.")
+
+    def remove_model(self, model_id):
+        info = catalog.get(model_id)
+        if model_id == catalog.STANDARD_MODEL:
+            raise ValueError(f"{info.title} is the default model and stays "
+                             "installed.")
+        users = [n for n, p in STORE.read().items()
+                 if voice_model_id(p) == model_id]
+        if users:
+            raise ValueError(f"{info.title} is used by these voices: "
+                             + ", ".join(users) + ". Delete them or move "
+                             "them to another model first.")
+        self.unload(model_id)
+        catalog.remove(MODELS_DIR, model_id)
+        _MODEL_FINGERPRINT_CACHE.pop(model_id, None)
+        return f"{info.title} was removed."
+
+    def apply_settings(self, quantize, continuation, progress):
+        changed_quantize = quantize != SETTINGS.get("quantize")
+        SETTINGS.set("quantize", quantize)
+        SETTINGS.set("continuation", continuation)
+        SETTINGS.save()
+        if changed_quantize:
+            progress("Reloading the AI models with the new setting...")
+            with self.gen_lock:
+                loaded = self.loaded_ids()
+                self.unload()
+            for model_id in loaded:
+                self.model_for(model_id)
+        return "The engine settings were saved."
 
     # -- voice packages -----------------------------------------------------
 
@@ -815,8 +1161,8 @@ class Engine:
             dest = dest.with_name(dest.name + PACKAGE_EXT)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        progress("Identifying the AI model these voices were made with...")
-        model = _model_fingerprint()
+        progress("Identifying the AI models these voices were made with...")
+        model = _model_fingerprint(catalog.STANDARD_MODEL)
 
         entries = []
         stems = set()
@@ -851,6 +1197,12 @@ class Engine:
                         "state_sha256": _sha256_file(state),
                         "source_member": None,
                         "source_sha256": None,
+                        "model_id": voice_model_id(props),
+                        "model_sha256": (props.get("model_sha256")
+                                         or _model_fingerprint(
+                                             voice_model_id(props)).get(
+                                                 "sha256", "")),
+                        "embedding": _int(props.get("embedding"), 1),
                     }
                     source_rel = props.get("source", "")
                     source = (VOICES_DIR / source_rel) if source_rel else None
@@ -875,7 +1227,10 @@ class Engine:
 
                 manifest = {
                     "kind": PACKAGE_KIND,
-                    "format": PACKAGE_FORMAT,
+                    "format": (1 if all(e["model_id"]
+                                        == catalog.STANDARD_MODEL
+                                        for e in entries)
+                               else PACKAGE_FORMAT),
                     "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                  time.gmtime()),
                     "created_by": ("Pocket TTS SAPI5 Voice Manager "
@@ -918,9 +1273,6 @@ class Engine:
         with this computer's model, 1 for another model but rebuildable from
         its audio sample, and 2 for another model with no audio sample."""
         manifest = _read_manifest(Path(path))
-        package_sha = str((manifest.get("model") or {}).get("sha256") or "")
-        local_sha = str(_model_fingerprint().get("sha256") or "")
-        same_model = bool(package_sha) and package_sha == local_sha
         existing = STORE.read()
 
         rows = []
@@ -932,7 +1284,13 @@ class Engine:
             if not name:
                 continue
             has_source = bool(entry.get("source_member"))
-            status = 0 if same_model else (1 if has_source else 2)
+            plan = _import_plan(entry, manifest)
+            if plan["target"] is None:
+                status = 3
+            elif plan["same"]:
+                status = 0
+            else:
+                status = 1 if has_source else 2
             female = str(entry.get("gender", "")).lower() == "female"
             rows.append((name, female, has_source, status))
             if _sanitize_name(name) in existing:
@@ -945,14 +1303,26 @@ class Engine:
         by = str(manifest.get("created_by", "an unknown version"))
         parts = [f"{len(rows)} voice(s) in this package, written {created} "
                  f"by {by}."]
-        if same_model:
-            parts.append("They were made with the same AI model as this "
-                         "computer, so they will sound exactly as intended.")
+        if all(row[3] == 0 for row in rows):
+            parts.append("They were made with the same AI models as this "
+                         "computer has, so they will sound exactly as "
+                         "intended.")
         else:
             rebuildable = sum(1 for row in rows if row[3] == 1)
             risky = sum(1 for row in rows if row[3] == 2)
-            parts.append("They were made with a different AI model than this "
-                         "computer.")
+            plans = [_import_plan(e, manifest)
+                     for e in manifest.get("voices", [])
+                     if isinstance(e, dict)]
+            missing = sorted({pl["wanted"] for pl in plans
+                              if pl["target"] is None})
+            parts.append("Some or all of them were made with a different AI "
+                         "model than this computer has.")
+            if missing:
+                parts.append(
+                    "Some need an AI model that is not installed here; "
+                    "download it under AI Models first: "
+                    + ", ".join(catalog.BY_ID[m].title if m in catalog.BY_ID
+                                else m for m in missing) + ".")
             if rebuildable:
                 parts.append(f"{rebuildable} of them include the audio sample "
                              "and will be rebuilt for your model "
@@ -973,9 +1343,6 @@ class Engine:
         2 replace the existing voice."""
         archive = Path(path)
         manifest = _read_manifest(archive)
-        package_sha = str((manifest.get("model") or {}).get("sha256") or "")
-        local_sha = str(_model_fingerprint().get("sha256") or "")
-        same_model = bool(package_sha) and package_sha == local_sha
 
         wanted = set(names or [])
         entries = [e for e in manifest.get("voices", [])
@@ -1030,8 +1397,16 @@ class Engine:
                         target = _unique_name(safe, voices)
                         progress(f'"{clash}" already exists, so this one is '
                                  f'being imported as "{target}".')
+                    plan = _import_plan(entry, manifest)
+                    if plan["target"] is None:
+                        info = catalog.BY_ID.get(plan["wanted"])
+                        raise RuntimeError(
+                            "it needs the AI model "
+                            + (info.title if info else plan["wanted"])
+                            + ", which is not installed. Download it under "
+                            "AI Models, then import again.")
                     self._install_package_voice(
-                        zf, entry, target, replacing, same_model, publish,
+                        zf, entry, target, replacing, plan, publish,
                         progress, budget)
                 except Exception as exc:   # noqa: BLE001
                     logger.exception("importing %r failed", name)
@@ -1044,7 +1419,7 @@ class Engine:
                     replaced.append(target)
                 elif clash is not None:
                     renamed.append(target)
-                if not same_model:
+                if not plan["same"]:
                     if entry.get("source_member"):
                         rebuilt.append(target)
                     else:
@@ -1093,7 +1468,7 @@ class Engine:
         logger.info("imported %d voice(s) from %s", len(imported), archive)
         return " ".join(parts)
 
-    def _install_package_voice(self, zf, entry, target, replacing, same_model,
+    def _install_package_voice(self, zf, entry, target, replacing, plan,
                                publish, progress, budget):
         """Unpack one voice out of an open package and register it.
 
@@ -1129,25 +1504,19 @@ class Engine:
                 _extract_member(zf, source_info, staged_source,
                                 entry.get("source_sha256"), budget)
 
-            if not same_model:
+            model_id = plan["target"]
+            built_with = plan["sha"]
+            recipe = _int(entry.get("embedding"), 1)
+            if not plan["same"]:
                 if staged_source is not None:
-                    if self.model is None:
-                        raise RuntimeError(
-                            self.load_error
-                            or "the AI model is not loaded, so this voice "
-                               "cannot be rebuilt for it")
-                    if not self.model.has_voice_cloning:
-                        raise RuntimeError(
-                            "this voice was made with a different AI model, "
-                            "and the installed model cannot rebuild voices")
                     progress(f'Rebuilding "{target}" for your AI model '
                              "(this can take a minute)...")
                     from pocket_tts.models.model_state import export_model_state
-                    with self.gen_lock:
-                        state = self.model.get_state_for_audio_prompt(
-                            staged_source, truncate=True)
+                    state = self._embed(model_id, staged_source)
                     export_model_state(state, staged_state)
                     _validate_state_file(staged_state)
+                    built_with = _model_fingerprint(model_id).get("sha256", "")
+                    recipe = EMBEDDING_RECIPE
                 else:
                     progress(f'"{target}" was made with a different AI model '
                              "and came without its audio sample, so it may "
@@ -1172,6 +1541,9 @@ class Engine:
                                == "female" else "Male"),
                     "language": _clean_language(entry.get("language")),
                     "published": "1" if publish else "0",
+                    "model": model_id,
+                    "model_sha256": built_with,
+                    "embedding": str(recipe),
                 }
                 if source_name:
                     props["source"] = f"src/{source_name}"
@@ -1202,6 +1574,81 @@ class Engine:
                                        old)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+# The installer writes voices.ini only on a fresh install, so that an upgrade
+# never touches the user's voices. Default voices added in a later version
+# are listed in defaults.ini, which every install overwrites, and are added
+# to voices.ini once: a default voice the user deleted stays deleted.
+DEFAULTS_INI = VOICES_DIR / "defaults.ini"
+DEFAULTS_OFFERED = VOICES_DIR / "defaults_offered.txt"
+# The default voices of every version before 1.3.0, which their installers
+# already offered.
+_CLASSIC_DEFAULTS = ("Alba", "Jane", "George", "Michael")
+
+
+def add_new_default_voices():
+    if not DEFAULTS_INI.exists():
+        return
+    try:
+        text = DEFAULTS_INI.read_text(encoding="utf-16")
+    except UnicodeError:
+        text = DEFAULTS_INI.read_text(encoding="utf-8-sig")
+    defaults = {}
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            defaults[section] = {}
+        elif "=" in line and section is not None:
+            key, _, value = line.partition("=")
+            defaults[section][key.strip().lower()] = value.strip()
+    try:
+        offered = {line.strip().lower() for line in
+                   DEFAULTS_OFFERED.read_text(encoding="utf-8").splitlines()
+                   if line.strip()}
+    except OSError:
+        offered = {name.lower() for name in _CLASSIC_DEFAULTS}
+    added = []
+
+    def mutate(voices):
+        present = {name.lower() for name in voices}
+        for name, props in defaults.items():
+            if name.lower() in offered:
+                continue
+            offered.add(name.lower())
+            if name.lower() in present:
+                continue
+            if not (VOICES_DIR / props.get("file", "")).exists():
+                continue
+            voices[name] = dict(props)
+            added.append(name)
+    STORE.update(mutate)
+    DEFAULTS_OFFERED.write_text("\n".join(sorted(offered)) + "\n",
+                                encoding="utf-8")
+    if added:
+        logger.info("added the new default voices %s", ", ".join(added))
+
+
+def _int(value, default):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _model_is_english(model) -> bool:
+    return getattr(model, "_pockettts_english", True)
+
+
+def _mark_built(name, model_id, sha):
+    def mutate(voices):
+        if name in voices:
+            voices[name]["model"] = model_id
+            voices[name]["model_sha256"] = sha
+            voices[name]["embedding"] = str(EMBEDDING_RECIPE)
+    STORE.update(mutate)
 
 
 # Everything str.splitlines() treats as a line break. Any of these inside a
@@ -1251,8 +1698,8 @@ def _human_size(count) -> str:
 
 def _pocket_tts_version() -> str:
     try:
-        import pocket_tts
-        return str(getattr(pocket_tts, "__version__", "unknown"))
+        from importlib.metadata import version
+        return version("pocket-tts")
     except Exception:   # noqa: BLE001
         return "unknown"
 
@@ -1260,25 +1707,56 @@ def _pocket_tts_version() -> str:
 _MODEL_FINGERPRINT_CACHE = {}
 
 
-def _model_fingerprint() -> dict:
-    """Size and SHA-256 of the active model weights.
+def _model_fingerprint(model_id: str = catalog.STANDARD_MODEL) -> dict:
+    """Size and SHA-256 of a model's weights.
 
-    A voice embedding only sounds right on the weights that produced it, so a
-    package records this and an import compares it. Hashing 220 MB costs about
-    a second, so the answer is cached per (size, mtime)."""
-    path = MODELS_DIR / "english" / "model.safetensors"
+    A voice embedding only sounds right on the weights that produced it, so
+    voices.ini and a package record this and an import compares it. Hashing
+    220 MB costs about a second, so the answer is cached per (size, mtime)."""
+    path = catalog.weights_file(MODELS_DIR, model_id)
     try:
         stat = path.stat()
     except OSError:
-        return {"file": path.name, "sha256": "", "size": 0}
+        return {"file": path.name, "sha256": "", "size": 0, "id": model_id}
     key = (str(path).lower(), stat.st_size, int(stat.st_mtime))
-    cached = _MODEL_FINGERPRINT_CACHE.get(key)
-    if cached is None:
-        cached = {"file": path.name, "sha256": _sha256_file(path),
-                  "size": stat.st_size}
-        _MODEL_FINGERPRINT_CACHE.clear()
-        _MODEL_FINGERPRINT_CACHE[key] = cached
-    return cached
+    cached = _MODEL_FINGERPRINT_CACHE.get(model_id)
+    if cached is None or cached[0] != key:
+        cached = (key, {"file": path.name, "sha256": _sha256_file(path),
+                        "size": stat.st_size, "id": model_id})
+        _MODEL_FINGERPRINT_CACHE[model_id] = cached
+    return cached[1]
+
+
+def _is_english_lcid(value) -> bool:
+    try:
+        return (int(str(value), 16) & 0x3FF) == 0x09
+    except ValueError:
+        return False
+
+
+def _import_plan(entry: dict, manifest: dict) -> dict:
+    """Which local model a packaged voice goes onto, and whether its
+    embedding can be used as it is.
+
+    wanted  the model the voice was made with (packages before format 2:
+            the standard English model)
+    sha     the weights it was made with
+    target  the installed model it will use, or None when it needs one that
+            is not installed here (an English voice falls back to the
+            standard model and is rebuilt; another language cannot)
+    same    True when the embedding fits `target` exactly"""
+    wanted = str(entry.get("model_id") or catalog.STANDARD_MODEL)
+    sha = str(entry.get("model_sha256")
+              or (manifest.get("model") or {}).get("sha256") or "")
+    target = None
+    if wanted in catalog.BY_ID and catalog.is_installed(MODELS_DIR, wanted):
+        target = wanted
+    elif (_is_english_lcid(entry.get("language", "409"))
+          and catalog.is_installed(MODELS_DIR, catalog.STANDARD_MODEL)):
+        target = catalog.STANDARD_MODEL
+    same = (target == wanted and bool(sha)
+            and sha == _model_fingerprint(target).get("sha256"))
+    return {"wanted": wanted, "sha": sha, "target": target, "same": same}
 
 
 _MEMBER_BAD_CHARS = set('\\/:*?"<>|')
@@ -1330,7 +1808,8 @@ def _read_manifest(archive: Path) -> dict:
     if not isinstance(manifest, dict) or manifest.get("kind") != PACKAGE_KIND:
         raise ValueError("this file is not a Pocket TTS voice package.")
     fmt = manifest.get("format")
-    if not isinstance(fmt, int) or fmt > PACKAGE_FORMAT:
+    if (not isinstance(fmt, int) or isinstance(fmt, bool)
+            or fmt > PACKAGE_FORMAT):
         raise ValueError(
             f"this package uses package format {fmt}, which this version does "
             "not understand. Please update Pocket TTS SAPI5.")
@@ -1559,6 +2038,17 @@ class Connection:
             self.handle_import(payload)
         elif cmd == CMD_INSPECT_PACKAGE:
             self.handle_inspect(payload)
+        elif cmd == CMD_LIST_MODELS:
+            self.handle_list_models()
+        elif cmd == CMD_REMOVE_MODEL:
+            self.handle_remove_model(payload)
+        elif cmd == CMD_SET_VOICE_MODEL:
+            self.handle_set_voice_model(payload)
+        elif cmd == CMD_GET_SETTINGS:
+            self.send(RESP_SETTINGS, struct.pack(
+                "<BB", SETTINGS.get("quantize"), SETTINGS.get("continuation")))
+        elif cmd == CMD_SET_SETTINGS:
+            self.handle_set_settings(payload)
         elif cmd == CMD_SHUTDOWN:
             self.send(RESP_OK)
             self.server.shutdown_requested.set()
@@ -1613,9 +2103,11 @@ class Connection:
                 lang = 0x409
             published = 1 if props.get("published", "0") == "1" else 0
             has_src = 1 if props.get("source") else 0
+            model = voice_model_id(props).encode("utf-8")
             parts.append(struct.pack("<H", len(encoded)) + encoded
                          + struct.pack("<BIBB", gender, lang, published,
-                                       has_src))
+                                       has_src)
+                         + struct.pack("<H", len(model)) + model)
         self.send(RESP_VOICES, b"".join(parts))
 
     def handle_clone(self, payload):
@@ -1624,12 +2116,17 @@ class Connection:
             path, offset = _read_str16(payload, offset)
             lang, offset = _read_str16(payload, offset)
             (gender,) = struct.unpack_from("<B", payload, offset)
+            offset += 1
+            # Managers before 1.3.0 send no model: the standard one.
+            model_id = (_read_str16(payload, offset)[0]
+                        if offset < len(payload) else "")
         except (struct.error, IndexError):
             self.send_text(RESP_ERROR, "malformed CLONE payload")
             return
         try:
             ENGINE.clone(name, path, gender, lang,
-                         lambda msg: self.send_text(RESP_PROGRESS, msg))
+                         lambda msg: self.send_text(RESP_PROGRESS, msg),
+                         model_id or None)
             self.send(RESP_OK)
         except Exception as exc:   # noqa: BLE001
             logger.exception("clone failed")
@@ -1688,13 +2185,17 @@ class Connection:
         self.send(RESP_OK)
 
     def handle_update(self, payload):
+        model_id = ""
         try:
-            token, _ = _read_str16(payload, 0)
+            token, offset = _read_str16(payload, 0)
+            if offset < len(payload):
+                model_id, _ = _read_str16(payload, offset)
         except (struct.error, IndexError):
             token = ""
         try:
             ENGINE.update_models(
-                token, lambda msg: self.send_text(RESP_PROGRESS, msg))
+                token, lambda msg: self.send_text(RESP_PROGRESS, msg),
+                model_id or None)
             self.send(RESP_OK)
         except Exception as exc:   # noqa: BLE001
             logger.exception("model update failed")
@@ -1708,14 +2209,83 @@ class Connection:
             self.send_text(RESP_ERROR, text + hint)
 
     def handle_info(self):
-        import pocket_tts
-        version = getattr(pocket_tts, "__version__", "3.x")
-        state = "ready" if ENGINE.model is not None else (
-            f"model not loaded: {ENGINE.load_error}")
+        version = _pocket_tts_version()
+        loaded = ENGINE.loaded_ids()
+        state = ("ready, models loaded: " + ", ".join(loaded) if loaded
+                 else f"model not loaded: {ENGINE.load_error}")
         info = (f"Pocket TTS SAPI5 {APP_VERSION}; pocket-tts {version}; "
                 f"engine {state}; data dir {DATA_DIR}; "
                 "sample rate 24000 Hz")
         self.send_text(RESP_INFO, info)
+
+    def handle_list_models(self):
+        loaded = set(ENGINE.loaded_ids())
+        voices = STORE.read()
+        used = {}
+        for props in voices.values():
+            mid = voice_model_id(props)
+            used[mid] = used.get(mid, 0) + 1
+        parts = [struct.pack("<I", len(catalog.CATALOG))]
+        for info in catalog.CATALOG:
+            fields = [_clip_utf8(text, 4000) for text in
+                      (info.id, info.title, info.description,
+                       ENGINE.load_errors.get(info.id, ""))]
+            record = b"".join(struct.pack("<H", len(f)) + f for f in fields)
+            record += struct.pack(
+                "<BBIII",
+                1 if catalog.is_installed(MODELS_DIR, info.id) else 0,
+                1 if info.id in loaded else 0,
+                info.size_mb, int(info.lcid, 16), used.get(info.id, 0))
+            parts.append(record)
+        self.send(RESP_MODELS, b"".join(parts))
+
+    def handle_remove_model(self, payload):
+        try:
+            model_id, _ = _read_str16(payload, 0)
+        except (struct.error, IndexError):
+            self.send_text(RESP_ERROR, "malformed REMOVE_MODEL payload")
+            return
+        try:
+            self.send_text(RESP_OK, ENGINE.remove_model(model_id))
+        except ValueError as exc:
+            logger.info("not removing model %s: %s", model_id, exc)
+            self.send_text(RESP_ERROR, str(exc))
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("removing model %s failed", model_id)
+            self.send_text(RESP_ERROR, str(exc))
+
+    def handle_set_voice_model(self, payload):
+        try:
+            name, offset = _read_str16(payload, 0)
+            model_id, offset = _read_str16(payload, offset)
+            (make_copy,) = struct.unpack_from("<B", payload, offset)
+            copy_name, _ = _read_str16(payload, offset + 1)
+        except (struct.error, IndexError):
+            self.send_text(RESP_ERROR, "malformed SET_VOICE_MODEL payload")
+            return
+        try:
+            summary = ENGINE.set_voice_model(
+                name, model_id, copy_name if make_copy else "",
+                lambda msg: self.send_text(RESP_PROGRESS, msg))
+            self.send_text(RESP_OK, summary)
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("changing the model of %r failed", name)
+            self.send_text(RESP_ERROR, str(exc))
+
+    def handle_set_settings(self, payload):
+        try:
+            quantize, continuation = struct.unpack_from("<BB", payload, 0)
+        except struct.error:
+            self.send_text(RESP_ERROR, "malformed SET_SETTINGS payload")
+            return
+        try:
+            summary = ENGINE.apply_settings(
+                bool(quantize), bool(continuation),
+                lambda msg: self.send_text(RESP_PROGRESS, msg))
+            self.send_text(RESP_OK, summary)
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("changing the settings failed")
+            self.send_text(RESP_ERROR, str(exc))
 
     def handle_export(self, payload):
         try:
@@ -1945,6 +2515,11 @@ def main():
         pass
     _opt_out_of_background_throttling()
 
+    try:
+        for config in catalog.rewrite_data_dir(MODELS_DIR, DATA_DIR):
+            logger.info("pointed %s at %s", config, DATA_DIR)
+    except OSError:
+        logger.warning("could not rewrite the model configs", exc_info=True)
     ENGINE.load()
     threading.Thread(target=ENGINE.after_load, daemon=True).start()
     server.serve()

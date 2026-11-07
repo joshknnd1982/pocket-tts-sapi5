@@ -6,8 +6,6 @@ samples
 bin/pocket-tts
 __pycache__
 build_log.txt
-installer/staging/models/*
-!installer/staging/models/english
-installer/staging/models/english/*
-!installer/staging/models/english/config.yaml
+# Staged by installer/prepare_voices.py from Kyutai's weights and configs.
+installer/staging/models/
 output/PocketTTS_SAPI5_Setup.exe

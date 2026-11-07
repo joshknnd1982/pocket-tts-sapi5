@@ -473,6 +473,16 @@ bool HostClient::listVoices(std::vector<HostVoice>& out, std::wstring& error)
         v.published = data[off + 5] != 0;
         v.hasSource = data[off + 6] != 0;
         off += 7;
+        // Hosts from 1.3.0 end each voice with its model's id.
+        if (off + 2 <= data.size()) {
+            uint16_t modelLen = 0;
+            memcpy(&modelLen, data.data() + off, 2);
+            if (off + 2 + modelLen <= data.size()) {
+                v.model = PocketTts::utils::string_to_wstring(
+                    std::string(data.data() + off + 2, modelLen));
+                off += 2 + modelLen;
+            }
+        }
         out.push_back(std::move(v));
     }
     return true;
@@ -480,7 +490,8 @@ bool HostClient::listVoices(std::vector<HostVoice>& out, std::wstring& error)
 
 bool HostClient::cloneVoice(const std::wstring& name, const std::wstring& audioPath,
                             bool female, const std::wstring& languageHex,
-                            ProgressCallback progress, void* user, std::wstring& error)
+                            ProgressCallback progress, void* user, std::wstring& error,
+                            const std::wstring& modelId)
 {
     CsLock lock(&cs_);
     if (!ensureConnected(90000)) {
@@ -494,6 +505,9 @@ bool HostClient::cloneVoice(const std::wstring& name, const std::wstring& audioP
     append_u16_string(payload, PocketTts::utils::wstring_to_string(languageHex));
     const char gender = female ? 1 : 0;
     payload.push_back(gender);
+    if (!modelId.empty()) {
+        append_u16_string(payload, PocketTts::utils::wstring_to_string(modelId));
+    }
 
     setRecvTimeout(10 * 60 * 1000);
     if (!sendFrame(CMD_CLONE, payload.data(), static_cast<uint32_t>(payload.size()))) {
@@ -584,7 +598,8 @@ bool HostClient::deleteVoice(const std::wstring& name, std::wstring& error)
 }
 
 bool HostClient::updateModels(const std::wstring& hfToken,
-                              ProgressCallback progress, void* user, std::wstring& error)
+                              ProgressCallback progress, void* user, std::wstring& error,
+                              const std::wstring& modelId)
 {
     CsLock lock(&cs_);
     if (!ensureConnected(90000)) {
@@ -593,6 +608,9 @@ bool HostClient::updateModels(const std::wstring& hfToken,
     }
     std::vector<char> payload;
     append_u16_string(payload, PocketTts::utils::wstring_to_string(hfToken));
+    if (!modelId.empty()) {
+        append_u16_string(payload, PocketTts::utils::wstring_to_string(modelId));
+    }
     setRecvTimeout(60 * 60 * 1000);
     if (!sendFrame(CMD_UPDATE_MODELS, payload.data(), static_cast<uint32_t>(payload.size()))) {
         disconnect();
@@ -803,6 +821,173 @@ bool HostClient::importVoices(const std::wstring& packagePath,
     setRecvTimeout(60 * 60 * 1000);
     if (!sendFrame(CMD_IMPORT_VOICES, payload.data(),
                    static_cast<uint32_t>(payload.size()))) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    return pumpLongOperation(progress, user, summary, error);
+}
+
+namespace {
+
+// Reads a <u16 length><utf8> string at `off`; false when the data runs out.
+bool read_u16_string(const std::vector<char>& data, size_t& off, std::wstring& out)
+{
+    if (off + 2 > data.size()) {
+        return false;
+    }
+    uint16_t length = 0;
+    memcpy(&length, data.data() + off, 2);
+    off += 2;
+    if (off + length > data.size()) {
+        return false;
+    }
+    out = PocketTts::utils::string_to_wstring(std::string(data.data() + off, length));
+    off += length;
+    return true;
+}
+
+}  // namespace
+
+bool HostClient::listModels(std::vector<HostModel>& out, std::wstring& error)
+{
+    CsLock lock(&cs_);
+    out.clear();
+    if (!ensureConnected(90000)) {
+        error = L"Could not reach the Pocket TTS engine host.";
+        return false;
+    }
+    setRecvTimeout(30000);
+    if (!sendFrame(CMD_LIST_MODELS, nullptr, 0)) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    uint32_t type = 0;
+    std::vector<char> data;
+    if (!readFrame(type, data)) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    if (type != RESP_MODELS || data.size() < 4) {
+        error = type == RESP_ERROR
+            ? L"The running engine is older than this Voice Manager. Sign out and back in, "
+              L"or end PocketTTSHost.exe in Task Manager, and try again."
+            : L"Unexpected reply from the engine host.";
+        return false;
+    }
+    uint32_t count = 0;
+    memcpy(&count, data.data(), 4);
+    size_t off = 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        HostModel m;
+        if (!read_u16_string(data, off, m.id) || !read_u16_string(data, off, m.title) ||
+            !read_u16_string(data, off, m.description) ||
+            !read_u16_string(data, off, m.loadError) || off + 14 > data.size()) {
+            break;
+        }
+        m.installed = data[off] != 0;
+        m.loaded = data[off + 1] != 0;
+        memcpy(&m.sizeMb, data.data() + off + 2, 4);
+        memcpy(&m.lcid, data.data() + off + 6, 4);
+        memcpy(&m.voices, data.data() + off + 10, 4);
+        off += 14;
+        out.push_back(std::move(m));
+    }
+    return true;
+}
+
+bool HostClient::removeModel(const std::wstring& modelId, std::wstring& summary,
+                             std::wstring& error)
+{
+    CsLock lock(&cs_);
+    summary.clear();
+    if (!ensureConnected(90000)) {
+        error = L"Could not reach the Pocket TTS engine host.";
+        return false;
+    }
+    std::vector<char> payload;
+    append_u16_string(payload, PocketTts::utils::wstring_to_string(modelId));
+    setRecvTimeout(120000);
+    if (!sendFrame(CMD_REMOVE_MODEL, payload.data(), static_cast<uint32_t>(payload.size()))) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    return pumpLongOperation(nullptr, nullptr, summary, error);
+}
+
+bool HostClient::setVoiceModel(const std::wstring& name, const std::wstring& modelId,
+                               const std::wstring& copyName, ProgressCallback progress,
+                               void* user, std::wstring& summary, std::wstring& error)
+{
+    CsLock lock(&cs_);
+    summary.clear();
+    if (!ensureConnected(90000)) {
+        error = L"Could not reach the Pocket TTS engine host.";
+        return false;
+    }
+    std::vector<char> payload;
+    append_u16_string(payload, PocketTts::utils::wstring_to_string(name));
+    append_u16_string(payload, PocketTts::utils::wstring_to_string(modelId));
+    payload.push_back(copyName.empty() ? 0 : 1);
+    append_u16_string(payload, PocketTts::utils::wstring_to_string(copyName));
+    DEBUG_LOG("setVoiceModel: \"%S\" -> %S (copy \"%S\")", name.c_str(),
+              modelId.c_str(), copyName.c_str());
+    setRecvTimeout(10 * 60 * 1000);
+    if (!sendFrame(CMD_SET_VOICE_MODEL, payload.data(),
+                   static_cast<uint32_t>(payload.size()))) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    return pumpLongOperation(progress, user, summary, error);
+}
+
+bool HostClient::getSettings(bool& quantize, bool& continuation, std::wstring& error)
+{
+    CsLock lock(&cs_);
+    quantize = continuation = false;
+    if (!ensureConnected(90000)) {
+        error = L"Could not reach the Pocket TTS engine host.";
+        return false;
+    }
+    setRecvTimeout(15000);
+    if (!sendFrame(CMD_GET_SETTINGS, nullptr, 0)) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    uint32_t type = 0;
+    std::vector<char> data;
+    if (!readFrame(type, data)) {
+        disconnect();
+        error = L"Connection to the engine host was lost.";
+        return false;
+    }
+    if (type != RESP_SETTINGS || data.size() < 2) {
+        error = L"Unexpected reply from the engine host.";
+        return false;
+    }
+    quantize = data[0] != 0;
+    continuation = data[1] != 0;
+    return true;
+}
+
+bool HostClient::setSettings(bool quantize, bool continuation, ProgressCallback progress,
+                             void* user, std::wstring& summary, std::wstring& error)
+{
+    CsLock lock(&cs_);
+    summary.clear();
+    if (!ensureConnected(90000)) {
+        error = L"Could not reach the Pocket TTS engine host.";
+        return false;
+    }
+    const char payload[2] = {static_cast<char>(quantize ? 1 : 0),
+                             static_cast<char>(continuation ? 1 : 0)};
+    setRecvTimeout(10 * 60 * 1000);
+    if (!sendFrame(CMD_SET_SETTINGS, payload, 2)) {
         disconnect();
         error = L"Connection to the engine host was lost.";
         return false;

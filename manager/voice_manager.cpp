@@ -1,7 +1,8 @@
 // Pocket TTS Voice Manager
 //
 // Accessible Win32 dialog application for cloning, testing, publishing and
-// removing Pocket TTS SAPI5 voices, and for updating the AI models. All
+// removing Pocket TTS SAPI5 voices, for moving a voice to another AI model,
+// and for downloading, updating and removing the AI models. All
 // functionality is reachable with the keyboard; only standard dialog
 // controls are used so screen readers announce everything correctly.
 
@@ -32,10 +33,12 @@ constexpr UINT WM_APP_STATUS = WM_APP + 1;   // lparam: std::wstring* (owned)
 constexpr UINT WM_APP_DONE = WM_APP + 2;     // wparam: 1 success, lparam: std::wstring* error (owned, may be null)
 constexpr UINT WM_APP_VOICES = WM_APP + 3;   // lparam: std::vector<HostVoice>* (owned)
 constexpr UINT WM_APP_PACKAGE = WM_APP + 4;  // lparam: PackageInfo* (owned)
+constexpr UINT WM_APP_MODELS = WM_APP + 5;   // lparam: ModelsSnapshot* (owned)
 
 HINSTANCE g_instance = nullptr;
 HostClient g_client;
 std::vector<HostVoice> g_voices;
+std::vector<HostModel> g_models;      // every model the engine knows
 std::wstring g_selectedVoice;
 bool g_busy = false;
 std::vector<PackageVoice> g_package;  // contents of the package being imported
@@ -72,6 +75,77 @@ std::wstring get_text(HWND dlg, int id)
     GetWindowTextW(ctrl, text.data(), len + 1);
     text.resize(static_cast<size_t>(len));
     return text;
+}
+
+// The standard English model; voices from engines before 1.3.0 report none.
+const wchar_t kStandardModel[] = L"english";
+
+std::wstring model_title(const std::wstring& id)
+{
+    const std::wstring wanted = id.empty() ? kStandardModel : id;
+    for (const auto& m : g_models) {
+        if (m.id == wanted) {
+            return m.title;
+        }
+    }
+    return wanted == kStandardModel ? L"English, standard" : wanted;
+}
+
+// A short word for a model, used to name a copy of a voice made with it.
+std::wstring model_short_name(const std::wstring& id)
+{
+    if (id == kStandardModel) return L"Standard";
+    if (id.rfind(L"english_18m", 0) == 0) return L"Small";
+    if (id.rfind(L"english_7m", 0) == 0) return L"Fast";
+    if (id.rfind(L"english_2m", 0) == 0) return L"Tiny";
+    if (id.rfind(L"english_drifting", 0) == 0) return L"Drifting";
+    std::wstring title = model_title(id);
+    const size_t comma = title.find(L',');
+    return comma == std::wstring::npos ? title : title.substr(0, comma);
+}
+
+// Fills a drop-down list with the installed models and returns their ids in
+// list order; `select` is chosen if it is among them, else the first.
+std::vector<std::wstring> fill_model_combo(HWND combo, const std::wstring& select,
+                                           const std::wstring& skip = std::wstring())
+{
+    std::vector<std::wstring> ids;
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (const auto& m : g_models) {
+        if (!m.installed || m.id == skip) {
+            continue;
+        }
+        ids.push_back(m.id);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(m.title.c_str()));
+    }
+    if (ids.empty() && skip != kStandardModel) {
+        // An engine from before 1.3.0 lists no models: it has the standard one.
+        ids.push_back(kStandardModel);
+        const std::wstring title = model_title(kStandardModel);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(title.c_str()));
+    }
+    int index = 0;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == select) {
+            index = static_cast<int>(i);
+        }
+    }
+    SendMessageW(combo, CB_SETCURSEL, index, 0);
+    return ids;
+}
+
+std::wstring combo_model(HWND dlg, int id, const std::vector<std::wstring>& ids)
+{
+    const LRESULT index = SendDlgItemMessageW(dlg, id, CB_GETCURSEL, 0, 0);
+    if (index == CB_ERR || static_cast<size_t>(index) >= ids.size()) {
+        return {};
+    }
+    return ids[static_cast<size_t>(index)];
+}
+
+void progress_to_dialog(const std::wstring& message, void* user)
+{
+    post_status(static_cast<HWND>(user), message);
 }
 
 // ---------------------------------------------------------------------------
@@ -173,22 +247,32 @@ private:
 // Main dialog: voice list
 // ---------------------------------------------------------------------------
 
+struct VoiceRefresh {
+    std::vector<HostVoice> voices;
+    std::vector<HostModel> models;
+};
+
 void refresh_voices_async(HWND dlg)
 {
     post_status(dlg, L"Connecting to the Pocket TTS engine (the first start can take a minute)...");
     CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
         HWND dlg = static_cast<HWND>(param);
-        auto* voices = new std::vector<HostVoice>();
+        auto* result = new VoiceRefresh();
         std::wstring error;
-        if (!g_client.listVoices(*voices, error)) {
+        if (!g_client.listVoices(result->voices, error)) {
             DEBUG_LOG("manager: listVoices failed: %S", error.c_str());
-            delete voices;
-            voices = nullptr;
+            delete result;
+            result = nullptr;
             post_status(dlg, L"Error: " + error);
         } else {
-            DEBUG_LOG("manager: listVoices returned %u voices", (unsigned)voices->size());
+            DEBUG_LOG("manager: listVoices returned %u voices",
+                      (unsigned)result->voices.size());
+            std::wstring modelError;
+            if (!g_client.listModels(result->models, modelError)) {
+                DEBUG_LOG("manager: listModels failed: %S", modelError.c_str());
+            }
         }
-        PostMessageW(dlg, WM_APP_VOICES, 0, reinterpret_cast<LPARAM>(voices));
+        PostMessageW(dlg, WM_APP_VOICES, 0, reinterpret_cast<LPARAM>(result));
         return 0;
     }, dlg, 0, nullptr);
 }
@@ -200,7 +284,8 @@ void fill_voice_list(HWND dlg)
     for (const auto& v : g_voices) {
         std::wstring item = v.name;
         item += v.female ? L" (female, " : L" (male, ";
-        item += v.published ? L"published)" : L"not published)";
+        item += v.published ? L"published, " : L"not published, ";
+        item += model_title(v.model) + L")";
         SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
     }
     if (!g_voices.empty()) {
@@ -233,7 +318,10 @@ struct CloneParams {
     std::wstring name;
     std::wstring file;
     bool female;
+    std::wstring model;
 };
+
+std::vector<std::wstring> g_cloneModels;  // ids behind the Clone dialog's model list
 
 INT_PTR CALLBACK CloneDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
 {
@@ -246,6 +334,7 @@ INT_PTR CALLBACK CloneDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
         SendMessageW(gender, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Male"));
         SendMessageW(gender, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Female"));
         SendMessageW(gender, CB_SETCURSEL, 0, 0);
+        g_cloneModels = fill_model_combo(GetDlgItem(dlg, IDC_CLONE_MODEL), kStandardModel);
         return TRUE;
     }
     case WM_APP_STATUS: {
@@ -297,6 +386,7 @@ INT_PTR CALLBACK CloneDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
             params->name = get_text(dlg, IDC_NAME);
             params->file = get_text(dlg, IDC_FILE);
             params->female = SendDlgItemMessageW(dlg, IDC_GENDER, CB_GETCURSEL, 0, 0) == 1;
+            params->model = combo_model(dlg, IDC_CLONE_MODEL, g_cloneModels);
             if (params->name.empty() || params->file.empty()) {
                 MessageBoxW(dlg, L"Please enter a voice name and choose an audio file.",
                             L"Missing information", MB_OK | MB_ICONWARNING);
@@ -308,16 +398,13 @@ INT_PTR CALLBACK CloneDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
             append_log(dlg, IDC_LOG, L"Starting the clone...");
             CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
                 auto* params = static_cast<CloneParams*>(p);
-                DEBUG_LOG("manager: cloning \"%S\" from \"%S\" (%s)",
+                DEBUG_LOG("manager: cloning \"%S\" from \"%S\" (%s, model %S)",
                           params->name.c_str(), params->file.c_str(),
-                          params->female ? "female" : "male");
+                          params->female ? "female" : "male", params->model.c_str());
                 std::wstring error;
                 const bool ok = g_client.cloneVoice(
                     params->name, params->file, params->female, L"409",
-                    [](const std::wstring& message, void* user) {
-                        post_status(static_cast<HWND>(user), message);
-                    },
-                    params->dlg, error);
+                    progress_to_dialog, params->dlg, error, params->model);
                 DEBUG_LOG("manager: clone %s%S%s", ok ? "succeeded" : "failed: ",
                           ok ? L"" : error.c_str(), "");
                 PostMessageW(params->dlg, WM_APP_DONE, ok ? 1 : 0,
@@ -455,18 +542,154 @@ INT_PTR CALLBACK TestDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
     return FALSE;
 }
 
+// CreateThread, with the handle closed straight away: nothing joins these
+// workers, they report back by posting to the dialog.
+bool start_worker(LPTHREAD_START_ROUTINE body, void* param)
+{
+    HANDLE thread = CreateThread(nullptr, 0, body, param, 0, nullptr);
+    if (!thread) {
+        DEBUG_LOG("manager: CreateThread failed, error %lu", GetLastError());
+        return false;
+    }
+    CloseHandle(thread);
+    return true;
+}
+
+void post_done(HWND dlg, bool ok, const std::wstring& message)
+{
+    PostMessageW(dlg, WM_APP_DONE, ok ? 1 : 0,
+                 reinterpret_cast<LPARAM>(new std::wstring(message)));
+}
+
 // ---------------------------------------------------------------------------
-// Update dialog
+// AI models dialog: download, update and remove models; engine options
 // ---------------------------------------------------------------------------
 
-INT_PTR CALLBACK UpdateDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
+struct ModelsSnapshot {
+    std::vector<HostModel> models;
+    bool quantize = false;
+    bool continuation = false;
+    bool settingsKnown = false;
+    std::wstring error;
+};
+
+struct ModelOp {
+    HWND dlg;
+    int op;  // 0 download or update, 1 remove, 2 save engine options
+    std::wstring model;
+    std::wstring token;
+    bool quantize;
+    bool continuation;
+};
+
+void fetch_models_async(HWND dlg)
 {
-    static bool updating = false;
+    start_worker([](LPVOID p) -> DWORD {
+        HWND dlg = static_cast<HWND>(p);
+        auto* snap = new ModelsSnapshot();
+        if (g_client.listModels(snap->models, snap->error)) {
+            std::wstring ignored;
+            snap->settingsKnown =
+                g_client.getSettings(snap->quantize, snap->continuation, ignored);
+        }
+        PostMessageW(dlg, WM_APP_MODELS, 0, reinterpret_cast<LPARAM>(snap));
+        return 0;
+    }, dlg);
+}
+
+std::wstring model_list_item(const HostModel& m)
+{
+    std::wstring item = m.title + L": ";
+    if (m.installed) {
+        item += L"installed";
+        if (m.voices == 1) {
+            item += L", used by 1 voice";
+        } else if (m.voices > 1) {
+            item += L", used by " + std::to_wstring(m.voices) + L" voices";
+        }
+        if (!m.loadError.empty()) {
+            item += L", failed to load";
+        }
+    } else {
+        item += L"not installed, about " + std::to_wstring(m.sizeMb) + L" MB to download";
+    }
+    return item;
+}
+
+void show_model_description(HWND dlg)
+{
+    const LRESULT index = SendDlgItemMessageW(dlg, IDC_MODEL_LIST, LB_GETCURSEL, 0, 0);
+    if (index == LB_ERR || static_cast<size_t>(index) >= g_models.size()) {
+        set_text(dlg, IDC_MODEL_DESC, L"");
+        return;
+    }
+    const HostModel& m = g_models[static_cast<size_t>(index)];
+    std::wstring text = m.description;
+    text += m.installed
+        ? L" Installed. Download or Update fetches Kyutai's current files for it again."
+        : L" Not installed: Download or Update fetches it (about " +
+              std::to_wstring(m.sizeMb) + L" MB).";
+    if (!m.loadError.empty()) {
+        text += L" It failed to load: " + m.loadError;
+    }
+    set_text(dlg, IDC_MODEL_DESC, text);
+}
+
+INT_PTR CALLBACK ModelsDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    static bool busy = false;
+    static std::wstring keepSelected;
+
+    auto set_busy = [dlg](bool value) {
+        busy = value;
+        for (int id : {IDOK, IDC_MODEL_REMOVE, IDC_OPT_SAVE}) {
+            EnableWindow(GetDlgItem(dlg, id), value ? FALSE : TRUE);
+        }
+    };
 
     switch (msg) {
     case WM_INITDIALOG:
-        updating = false;
+        keepSelected = kStandardModel;
+        set_busy(true);
+        append_log(dlg, IDC_LOG, L"Asking the engine which AI models it has...");
+        fetch_models_async(dlg);
         return TRUE;
+    case WM_APP_MODELS: {
+        auto* snap = reinterpret_cast<ModelsSnapshot*>(lparam);
+        set_busy(false);
+        if (!snap->error.empty()) {
+            append_log(dlg, IDC_LOG, L"Error: " + snap->error);
+        } else {
+            g_models = snap->models;
+            HWND list = GetDlgItem(dlg, IDC_MODEL_LIST);
+            SendMessageW(list, LB_RESETCONTENT, 0, 0);
+            int select = 0;
+            for (size_t i = 0; i < g_models.size(); ++i) {
+                const std::wstring item = model_list_item(g_models[i]);
+                SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+                if (g_models[i].id == keepSelected) {
+                    select = static_cast<int>(i);
+                }
+            }
+            SendMessageW(list, LB_SETCURSEL, select, 0);
+            show_model_description(dlg);
+            if (snap->settingsKnown) {
+                CheckDlgButton(dlg, IDC_OPT_QUANTIZE, snap->quantize ? BST_CHECKED : BST_UNCHECKED);
+                CheckDlgButton(dlg, IDC_OPT_CONTINUATION,
+                               snap->continuation ? BST_CHECKED : BST_UNCHECKED);
+            }
+            size_t installed = 0;
+            for (const auto& m : g_models) {
+                installed += m.installed ? 1 : 0;
+            }
+            wchar_t line[128];
+            swprintf_s(line, L"%zu AI models are available, %zu of them installed.",
+                       g_models.size(), installed);
+            append_log(dlg, IDC_LOG, line);
+        }
+        delete snap;
+        return TRUE;
+    }
     case WM_APP_STATUS: {
         auto* text = reinterpret_cast<std::wstring*>(lparam);
         append_log(dlg, IDC_LOG, *text);
@@ -474,50 +697,235 @@ INT_PTR CALLBACK UpdateDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
         return TRUE;
     }
     case WM_APP_DONE: {
-        auto* error = reinterpret_cast<std::wstring*>(lparam);
-        updating = false;
-        EnableWindow(GetDlgItem(dlg, IDOK), TRUE);
-        if (wparam) {
-            MessageBoxW(dlg, L"The AI models are up to date and all voices were rebuilt.",
-                        L"Update complete", MB_OK | MB_ICONINFORMATION);
-            EndDialog(dlg, IDOK);
-        } else {
-            MessageBoxW(dlg, error ? error->c_str() : L"The update failed.",
-                        L"Update failed", MB_OK | MB_ICONERROR);
-        }
-        delete error;
+        auto* message = reinterpret_cast<std::wstring*>(lparam);
+        const std::wstring text = message ? *message : std::wstring();
+        delete message;
+        append_log(dlg, IDC_LOG, text);
+        MessageBoxW(dlg, text.c_str(), wparam ? L"AI Models" : L"AI Models: it did not work",
+                    MB_OK | (wparam ? MB_ICONINFORMATION : MB_ICONERROR));
+        // The list says what is installed and used now.
+        fetch_models_async(dlg);
         return TRUE;
     }
     case WM_COMMAND:
         switch (LOWORD(wparam)) {
-        case IDOK: {
-            if (updating) {
+        case IDC_MODEL_LIST:
+            if (HIWORD(wparam) == LBN_SELCHANGE) {
+                show_model_description(dlg);
+            }
+            return TRUE;
+        case IDOK:
+        case IDC_MODEL_REMOVE:
+        case IDC_OPT_SAVE: {
+            if (busy) {
                 return TRUE;
             }
-            updating = true;
-            EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
-            append_log(dlg, IDC_LOG, L"Starting the model update...");
-            auto* token = new std::pair<HWND, std::wstring>(dlg, get_text(dlg, IDC_TOKEN));
-            CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
-                auto* params = static_cast<std::pair<HWND, std::wstring>*>(p);
-                DEBUG_LOG("manager: model update started (token %s)",
-                          params->second.empty() ? "absent" : "provided");
+            auto* op = new ModelOp();
+            op->dlg = dlg;
+            op->op = LOWORD(wparam) == IDOK ? 0 : (LOWORD(wparam) == IDC_MODEL_REMOVE ? 1 : 2);
+            op->quantize = IsDlgButtonChecked(dlg, IDC_OPT_QUANTIZE) == BST_CHECKED;
+            op->continuation = IsDlgButtonChecked(dlg, IDC_OPT_CONTINUATION) == BST_CHECKED;
+            op->token = get_text(dlg, IDC_TOKEN);
+            if (op->op != 2) {
+                const LRESULT index =
+                    SendDlgItemMessageW(dlg, IDC_MODEL_LIST, LB_GETCURSEL, 0, 0);
+                if (index == LB_ERR || static_cast<size_t>(index) >= g_models.size()) {
+                    MessageBoxW(dlg, L"Please select an AI model in the list first.",
+                                L"No model selected", MB_OK | MB_ICONWARNING);
+                    delete op;
+                    return TRUE;
+                }
+                const HostModel& m = g_models[static_cast<size_t>(index)];
+                op->model = m.id;
+                keepSelected = m.id;
+                if (op->op == 1) {
+                    if (!m.installed) {
+                        MessageBoxW(dlg, L"That model is not installed.", L"Remove Model",
+                                    MB_OK | MB_ICONINFORMATION);
+                        delete op;
+                        return TRUE;
+                    }
+                    const std::wstring prompt = L"Remove " + m.title +
+                        L" from this computer? You can download it again later.";
+                    if (MessageBoxW(dlg, prompt.c_str(), L"Remove Model",
+                                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                        delete op;
+                        return TRUE;
+                    }
+                }
+            }
+            set_busy(true);
+            append_log(dlg, IDC_LOG, op->op == 0 ? L"Starting the download..."
+                                     : op->op == 1 ? L"Removing the model..."
+                                                   : L"Saving the engine options...");
+            if (!start_worker([](LPVOID p) -> DWORD {
+                auto* op = static_cast<ModelOp*>(p);
+                std::wstring summary;
                 std::wstring error;
-                const bool ok = g_client.updateModels(
-                    params->second,
-                    [](const std::wstring& message, void* user) {
-                        post_status(static_cast<HWND>(user), message);
-                    },
-                    params->first, error);
-                PostMessageW(params->first, WM_APP_DONE, ok ? 1 : 0,
-                             reinterpret_cast<LPARAM>(ok ? nullptr : new std::wstring(error)));
-                delete params;
+                bool ok = false;
+                DEBUG_LOG("manager: model op %d on %S", op->op, op->model.c_str());
+                if (op->op == 0) {
+                    ok = g_client.updateModels(op->token, progress_to_dialog, op->dlg, error,
+                                               op->model);
+                    summary = model_title(op->model) +
+                              L" is installed and up to date, and its voices were rebuilt.";
+                } else if (op->op == 1) {
+                    ok = g_client.removeModel(op->model, summary, error);
+                } else {
+                    ok = g_client.setSettings(op->quantize, op->continuation,
+                                              progress_to_dialog, op->dlg, summary, error);
+                }
+                if (!ok) {
+                    DEBUG_LOG("manager: model op %d failed: %S", op->op, error.c_str());
+                }
+                post_done(op->dlg, ok, ok ? summary : error);
+                delete op;
                 return 0;
-            }, token, 0, nullptr);
+            }, op)) {
+                delete op;
+                set_busy(false);
+                append_log(dlg, IDC_LOG, L"The work could not be started.");
+            }
             return TRUE;
         }
         case IDCANCEL:
-            if (!updating) {
+            if (!busy) {
+                EndDialog(dlg, IDOK);
+            }
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// Voice model dialog: rebuild a voice for another AI model, or copy it
+// ---------------------------------------------------------------------------
+
+struct VoiceModelParams {
+    HWND dlg;
+    std::wstring voice;
+    std::wstring model;
+    std::wstring copyName;
+};
+
+HostVoice g_vmVoice;                      // the voice the dialog is about
+std::vector<std::wstring> g_vmModels;     // ids behind its model list
+
+void suggest_copy_name(HWND dlg)
+{
+    const std::wstring model = combo_model(dlg, IDC_VM_MODEL, g_vmModels);
+    set_text(dlg, IDC_VM_NAME, g_vmVoice.name + L" " + model_short_name(model));
+}
+
+INT_PTR CALLBACK VoiceModelDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    static bool working = false;
+    static bool nameTyped = false;
+
+    switch (msg) {
+    case WM_INITDIALOG: {
+        working = false;
+        nameTyped = false;
+        const std::wstring intro = L"\"" + g_vmVoice.name + L"\" is made with " +
+            model_title(g_vmVoice.model) +
+            L". It is rebuilt from its audio sample for the model you choose.";
+        set_text(dlg, IDC_VM_INTRO, intro);
+        const std::wstring current = g_vmVoice.model.empty() ? kStandardModel : g_vmVoice.model;
+        g_vmModels = fill_model_combo(GetDlgItem(dlg, IDC_VM_MODEL), L"", current);
+        if (g_vmModels.empty()) {
+            append_log(dlg, IDC_LOG, L"No other AI model is installed. Download one under "
+                                     L"AI Models first.");
+            EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
+        }
+        CheckDlgButton(dlg, IDC_VM_COPY, BST_CHECKED);
+        suggest_copy_name(dlg);
+        nameTyped = false;
+        return TRUE;
+    }
+    case WM_APP_STATUS: {
+        auto* text = reinterpret_cast<std::wstring*>(lparam);
+        append_log(dlg, IDC_LOG, *text);
+        delete text;
+        return TRUE;
+    }
+    case WM_APP_DONE: {
+        auto* message = reinterpret_cast<std::wstring*>(lparam);
+        const std::wstring text = message ? *message : std::wstring();
+        delete message;
+        working = false;
+        EnableWindow(GetDlgItem(dlg, IDOK), TRUE);
+        append_log(dlg, IDC_LOG, text);
+        if (wparam) {
+            MessageBoxW(dlg, text.c_str(), L"Voice made", MB_OK | MB_ICONINFORMATION);
+            EndDialog(dlg, IDOK);
+        } else {
+            MessageBoxW(dlg, text.c_str(), L"The voice could not be made",
+                        MB_OK | MB_ICONERROR);
+        }
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wparam)) {
+        case IDC_VM_MODEL:
+            if (HIWORD(wparam) == CBN_SELCHANGE && !nameTyped) {
+                suggest_copy_name(dlg);
+                nameTyped = false;
+            }
+            return TRUE;
+        case IDC_VM_NAME:
+            if (HIWORD(wparam) == EN_CHANGE && GetFocus() == GetDlgItem(dlg, IDC_VM_NAME)) {
+                nameTyped = true;
+            }
+            return TRUE;
+        case IDC_VM_COPY:
+            EnableWindow(GetDlgItem(dlg, IDC_VM_NAME),
+                         IsDlgButtonChecked(dlg, IDC_VM_COPY) == BST_CHECKED);
+            return TRUE;
+        case IDOK: {
+            if (working) {
+                return TRUE;
+            }
+            auto* params = new VoiceModelParams();
+            params->dlg = dlg;
+            params->voice = g_vmVoice.name;
+            params->model = combo_model(dlg, IDC_VM_MODEL, g_vmModels);
+            if (IsDlgButtonChecked(dlg, IDC_VM_COPY) == BST_CHECKED) {
+                params->copyName = get_text(dlg, IDC_VM_NAME);
+                if (params->copyName.empty()) {
+                    MessageBoxW(dlg, L"Please enter a name for the copy.",
+                                L"Missing information", MB_OK | MB_ICONWARNING);
+                    delete params;
+                    return TRUE;
+                }
+            }
+            if (params->model.empty()) {
+                delete params;
+                return TRUE;
+            }
+            working = true;
+            EnableWindow(GetDlgItem(dlg, IDOK), FALSE);
+            append_log(dlg, IDC_LOG, L"Starting...");
+            if (!start_worker([](LPVOID p) -> DWORD {
+                auto* params = static_cast<VoiceModelParams*>(p);
+                std::wstring summary;
+                std::wstring error;
+                const bool ok = g_client.setVoiceModel(params->voice, params->model,
+                                                       params->copyName, progress_to_dialog,
+                                                       params->dlg, summary, error);
+                post_done(params->dlg, ok, ok ? summary : error);
+                delete params;
+                return 0;
+            }, params)) {
+                delete params;
+                working = false;
+                EnableWindow(GetDlgItem(dlg, IDOK), TRUE);
+            }
+            return TRUE;
+        }
+        case IDCANCEL:
+            if (!working) {
                 EndDialog(dlg, IDCANCEL);
             }
             return TRUE;
@@ -568,19 +976,6 @@ void select_all_items(HWND dlg, int listId)
     SendMessageW(list, LB_SETCARETINDEX, 0, 0);
 }
 
-// CreateThread, with the handle closed straight away: nothing joins these
-// workers, they report back by posting to the dialog.
-bool start_worker(LPTHREAD_START_ROUTINE body, void* param)
-{
-    HANDLE thread = CreateThread(nullptr, 0, body, param, 0, nullptr);
-    if (!thread) {
-        DEBUG_LOG("manager: CreateThread failed, error %lu", GetLastError());
-        return false;
-    }
-    CloseHandle(thread);
-    return true;
-}
-
 std::wstring default_package_path()
 {
     PWSTR folder = nullptr;
@@ -605,12 +1000,6 @@ void copy_to_buffer(const std::wstring& text, wchar_t* buffer, size_t capacity)
     if (!text.empty() && text.size() < capacity) {
         memcpy(buffer, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
     }
-}
-
-void post_done(HWND dlg, bool ok, const std::wstring& message)
-{
-    PostMessageW(dlg, WM_APP_DONE, ok ? 1 : 0,
-                 reinterpret_cast<LPARAM>(new std::wstring(message)));
 }
 
 struct ExportParams {
@@ -884,6 +1273,8 @@ INT_PTR CALLBACK ImportDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
                     item += L", will be rebuilt for your AI model";
                 } else if (v.status == PACKAGE_NO_SAMPLE) {
                     item += L", made with a different AI model, may not sound correct";
+                } else if (v.status == PACKAGE_NEEDS_MODEL) {
+                    item += L", needs an AI model that is not installed";
                 }
                 item += L")";
                 SendMessageW(list, LB_ADDSTRING, 0,
@@ -1101,10 +1492,13 @@ INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
         return TRUE;
     }
     case WM_APP_VOICES: {
-        auto* voices = reinterpret_cast<std::vector<HostVoice>*>(lparam);
-        if (voices) {
-            g_voices = std::move(*voices);
-            delete voices;
+        auto* result = reinterpret_cast<VoiceRefresh*>(lparam);
+        if (result) {
+            g_voices = std::move(result->voices);
+            if (!result->models.empty()) {
+                g_models = std::move(result->models);
+            }
+            delete result;
             fill_voice_list(dlg);
             wchar_t status[64];
             swprintf_s(status, L"%zu voice(s).", g_voices.size());
@@ -1196,11 +1590,37 @@ INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wparam, LPARAM lparam)
             return TRUE;
         case IDC_UPDATE:
             if (!g_busy) {
-                if (DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_UPDATE), dlg, UpdateDlgProc) == IDOK) {
+                DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_UPDATE), dlg, ModelsDlgProc);
+                // A download rebuilds voices and a removal changes what is
+                // installed, so the list is read again either way.
+                refresh_voices_async(dlg);
+            }
+            return TRUE;
+        case IDC_VOICE_MODEL: {
+            const HostVoice* voice = selected_voice(dlg);
+            if (!voice) {
+                MessageBoxW(dlg, L"Please select a voice in the list first.",
+                            L"No voice selected", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            if (!voice->hasSource) {
+                MessageBoxW(dlg,
+                            L"This voice has no audio sample on this computer, so it cannot "
+                            L"be made with another AI model. Clone it again from the "
+                            L"original recording.",
+                            L"Change AI Model", MB_OK | MB_ICONINFORMATION);
+                return TRUE;
+            }
+            if (!g_busy) {
+                g_vmVoice = *voice;
+                g_selectedVoice = voice->name;
+                if (DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_VOICE_MODEL), dlg,
+                               VoiceModelDlgProc) == IDOK) {
                     refresh_voices_async(dlg);
                 }
             }
             return TRUE;
+        }
         case IDC_REFRESH:
             if (!g_busy) {
                 refresh_voices_async(dlg);

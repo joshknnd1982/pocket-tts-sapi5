@@ -15,6 +15,19 @@ $embedUrl = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-embe
 $devPython = "$env:USERPROFILE\.pockettts\venv\Scripts\python.exe"
 if (-not (Test-Path $devPython)) { $devPython = "py" }
 
+# The pocket-tts the runtime is built from: Kyutai's 4.0.1 with their fixes
+# up to 2026-11-06 (kyutai-labs/pocket-tts main). The host relies on its
+# internals, so a different version is a deliberate change, tested first.
+$pocketTtsCommit = "28770c06f7deb1b65617834e60a6add7a4ff5b6d"
+$pocketTts = Join-Path $root "bin\pocket-tts"
+if (-not (Test-Path $pocketTts)) {
+    git clone --quiet https://github.com/kyutai-labs/pocket-tts.git $pocketTts
+    if ($LASTEXITCODE -ne 0) { throw "could not clone pocket-tts" }
+}
+git -C $pocketTts fetch --quiet origin
+git -C $pocketTts checkout --quiet $pocketTtsCommit
+if ($LASTEXITCODE -ne 0) { throw "could not check out pocket-tts $pocketTtsCommit" }
+
 if (Test-Path $runtime) {
     Write-Host "Removing existing runtime directory..."
     Remove-Item -Recurse -Force $runtime

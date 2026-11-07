@@ -12,10 +12,10 @@ enum HostCommand : uint32_t {
     CMD_LIST_VOICES = 1,
     CMD_SPEAK = 2,          // <u16 voice_len><voice utf8><u32 text_len><text utf8>[<u8 flags>]
     CMD_STOP = 3,
-    CMD_CLONE = 4,          // <u16+name><u16+audio_path><u16+language_hex><u8 gender>
+    CMD_CLONE = 4,          // <u16+name><u16+audio_path><u16+language_hex><u8 gender>[<u16+model_id>]
     CMD_SET_PUBLISHED = 5,  // <u16+name><u8 published>
     CMD_DELETE_VOICE = 6,   // <u16+name>
-    CMD_UPDATE_MODELS = 7,  // <u16+hf_token (may be empty)>
+    CMD_UPDATE_MODELS = 7,  // <u16+hf_token (may be empty)>[<u16+model_id>]: download or update one model
     CMD_SHUTDOWN = 8,
     CMD_INFO = 9,
     // Voice packages (.pttsvoices), for sharing voices between computers.
@@ -23,6 +23,12 @@ enum HostCommand : uint32_t {
     CMD_EXPORT_VOICES = 10,   // <u16+dest_path><u8 include_sources><u32 count>{<u16+name>}
     CMD_IMPORT_VOICES = 11,   // <u16+package_path><u8 publish><u8 collision><u32 count>{<u16+name>}
     CMD_INSPECT_PACKAGE = 12, // <u16+package_path>
+    // AI models (1.3.0). Every voice belongs to one model.
+    CMD_LIST_MODELS = 13,     // -> RESP_MODELS
+    CMD_REMOVE_MODEL = 14,    // <u16+model_id>
+    CMD_SET_VOICE_MODEL = 15, // <u16+name><u16+model_id><u8 make_copy><u16+copy_name>
+    CMD_GET_SETTINGS = 16,    // -> RESP_SETTINGS
+    CMD_SET_SETTINGS = 17,    // <u8 quantize><u8 continuation>
 };
 
 // CMD_SPEAK flags. The byte is optional: hosts before 1.2.2 ignore it, and
@@ -43,11 +49,15 @@ enum HostResponse : uint32_t {
     RESP_ERROR = 1,       // payload: utf8 message
     RESP_AUDIO = 2,       // payload: raw PCM, 16-bit mono 24000 Hz
     RESP_AUDIO_END = 3,   // <f32 speed_factor> (see below; absent on old hosts)
-    RESP_VOICES = 4,      // <u32 count>{<u16+name><u8 female><u32 lcid><u8 published><u8 has_src>}
+    RESP_VOICES = 4,      // <u32 count>{<u16+name><u8 female><u32 lcid><u8 published><u8 has_src>[<u16+model_id>]}
     RESP_PONG = 5,        // <f32 speed_factor> (absent on old hosts)
     RESP_PROGRESS = 6,    // payload: utf8 message
     RESP_INFO = 7,        // payload: utf8 message
     RESP_PACKAGE = 8,     // <u16+summary><u32 count>{<u16+name><u8 female><u8 has_src><u8 status>}
+    // <u32 count>{<u16+id><u16+title><u16+description><u16+load_error>
+    //             <u8 installed><u8 loaded><u32 size_mb><u32 lcid><u32 voices>}
+    RESP_MODELS = 9,
+    RESP_SETTINGS = 10,   // <u8 quantize><u8 continuation>
 };
 
 // Per-voice status in a RESP_PACKAGE reply.
@@ -55,6 +65,7 @@ enum HostPackageStatus : uint8_t {
     PACKAGE_READY = 0,        // made with this computer's model
     PACKAGE_WILL_REBUILD = 1, // other model, but the audio sample is included
     PACKAGE_NO_SAMPLE = 2,    // other model and no audio sample
+    PACKAGE_NEEDS_MODEL = 3,  // needs a model that is not installed here
 };
 
 // Host candidate ports, tried in order; the active one is written to

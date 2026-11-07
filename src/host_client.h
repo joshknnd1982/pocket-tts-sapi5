@@ -18,6 +18,20 @@ struct HostVoice {
     uint32_t lcid = 0x409;
     bool published = false;
     bool hasSource = false;
+    std::wstring model;     // id of the AI model the voice belongs to
+};
+
+// One AI model the host knows, installed or not.
+struct HostModel {
+    std::wstring id;
+    std::wstring title;
+    std::wstring description;
+    std::wstring loadError;  // why it failed to load, if it did
+    bool installed = false;
+    bool loaded = false;
+    uint32_t sizeMb = 0;
+    uint32_t lcid = 0x409;
+    uint32_t voices = 0;     // voices that use it
 };
 
 // One voice inside a .pttsvoices package, as reported by inspectPackage.
@@ -62,13 +76,30 @@ public:
                AudioCallback callback, void* user, bool spell = false);
 
     bool listVoices(std::vector<HostVoice>& out, std::wstring& error);
+    // An empty `modelId` means the standard English model.
     bool cloneVoice(const std::wstring& name, const std::wstring& audioPath,
                     bool female, const std::wstring& languageHex,
-                    ProgressCallback progress, void* user, std::wstring& error);
+                    ProgressCallback progress, void* user, std::wstring& error,
+                    const std::wstring& modelId = std::wstring());
     bool setPublished(const std::wstring& name, bool published, std::wstring& error);
     bool deleteVoice(const std::wstring& name, std::wstring& error);
+    // Downloads or updates one model (empty: the standard English model).
     bool updateModels(const std::wstring& hfToken,
-                      ProgressCallback progress, void* user, std::wstring& error);
+                      ProgressCallback progress, void* user, std::wstring& error,
+                      const std::wstring& modelId = std::wstring());
+
+    // AI models and engine settings.
+    bool listModels(std::vector<HostModel>& out, std::wstring& error);
+    bool removeModel(const std::wstring& modelId, std::wstring& summary,
+                     std::wstring& error);
+    // Rebuilds the voice for another model; with a non-empty `copyName` the
+    // voice is kept as it is and a new voice of that name is made instead.
+    bool setVoiceModel(const std::wstring& name, const std::wstring& modelId,
+                       const std::wstring& copyName, ProgressCallback progress,
+                       void* user, std::wstring& summary, std::wstring& error);
+    bool getSettings(bool& quantize, bool& continuation, std::wstring& error);
+    bool setSettings(bool quantize, bool continuation, ProgressCallback progress,
+                     void* user, std::wstring& summary, std::wstring& error);
 
     // Voice packages. An empty `names` means every voice in the store, or
     // every voice in the package.
